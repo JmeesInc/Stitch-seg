@@ -5873,7 +5873,7 @@ requires-dist = [
     { name = "imageio-ffmpeg", specifier = ">=0.5.1" },
     { name = "ipykernel", specifier = ">=6.29.5" },
     { name = "jupyter", specifier = ">=1.1.1" },
-    { name = "kaleido", specifier = ">=0.2.1" },
+    { name = "kaleido", specifier = "==0.2.1" },
     { name = "kornia", specifier = ">=0.7.3" },
     { name = "matplotlib", specifier = ">=3.7.5" },
     { name = "pandas", specifier = ">=2.0.3" },

@@ -21,7 +21,19 @@ else:
 torch.backends.cudnn.deterministic = True
 
 
-@torch.cuda.amp.custom_fwd(cast_inputs=torch.float32)
+def _custom_fwd(*, cast_inputs=None):
+    """
+    Torch AMP decorator compatibility wrapper.
+
+    - New API (recommended): torch.amp.custom_fwd(..., device_type="cuda")
+    - Old API (deprecated): torch.cuda.amp.custom_fwd(...)
+    """
+    if hasattr(torch, "amp") and hasattr(torch.amp, "custom_fwd"):
+        return torch.amp.custom_fwd(cast_inputs=cast_inputs, device_type="cuda")
+    return torch.cuda.amp.custom_fwd(cast_inputs=cast_inputs)
+
+
+@_custom_fwd(cast_inputs=torch.float32)
 def normalize_keypoints(
     kpts: torch.Tensor, size: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
