@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "stitch-seg-project"
+name = "stitch-seg"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
