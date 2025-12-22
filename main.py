@@ -33,6 +33,7 @@ class CFG:
     segmentation_weights = "/mnt/devices/dl1/in-data/data3/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
     num_classes = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tool_class_ch = 0
 
     debug = True
     debug_dir = "video"

@@ -397,7 +397,6 @@ class StitchInferencer(nn.Module):
                     # p_prev = inv(H_rel) @ T_curr @ p_curr
                     #H_cum_curr = self.H_cum @ torch.linalg.inv(H_rel_t)
                 if isinstance(H_inv, tuple):
-                    print("first frame")
                     self.reset_state()
                     self.first_frame(frame_u, tool_mask_raw, depth_mask_raw)
                     return
