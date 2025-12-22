@@ -40,7 +40,7 @@ from .stitch_utils_torch import (
 )
 
 
-class StitchInferencerDev(nn.Module):
+class StitchInferencer(nn.Module):
     """Stateful stitching engine that exposes stitched crops to a seg model.
 
     Flow summary:
