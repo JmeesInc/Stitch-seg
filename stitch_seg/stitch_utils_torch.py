@@ -466,18 +466,7 @@ def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy,
         resized_mask = tool_mask.to(torch.uint8).squeeze(0)
         # Mask out tool in input
         img_to_warp.masked_fill_(resized_mask > 0, 0)
-    # Warp Image
-    # Kornia warp expects (B, C, H, W)
     ch, cw = canvas.shape[-2:]
-    
-    warped = kornia.geometry.transform.warp_perspective(
-        img_to_warp.float(), 
-        H_total.unsqueeze(0), 
-        dsize=(ch, cw), 
-        mode='nearest', 
-        padding_mode='zeros' # Replicate
-    )
-    warped = warped.to(canvas.dtype)
 
     # Create & Warp Mask
     mask = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device) # (H, W)
@@ -491,25 +480,29 @@ def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy,
         mask[:, -trim_px:] = 0
         
     mask_b = mask.unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
-    warped_mask = kornia.geometry.transform.warp_perspective(
-        mask_b, 
-        H_total.unsqueeze(0), 
-        dsize=(ch, cw), 
-        mode='nearest'
-    ) # default padding zero
-    
+
+    # ---- Batch warp (image + mask + tool_mask) to reduce overhead ----
+    # Kornia warp expects (B, C, H, W). We pack everything into channels and warp once.
     if resized_mask is not None:
         rm_b = resized_mask.float().unsqueeze(0)
-        if rm_b.dim() == 3: rm_b = rm_b.unsqueeze(0)
-        
-        warped_tool_mask = kornia.geometry.transform.warp_perspective(
-            rm_b, 
-            H_total.unsqueeze(0), 
-            dsize=(ch, cw), 
-            mode='nearest'
-        )
+        if rm_b.dim() == 3:
+            rm_b = rm_b.unsqueeze(0)  # (1, 1, H, W)
     else:
-        warped_tool_mask = torch.zeros((1, 1, ch, cw), device=device)
+        rm_b = torch.zeros_like(mask_b)
+
+    c_img = img_to_warp.shape[1]
+    packed = torch.cat([img_to_warp.float(), mask_b, rm_b], dim=1)  # (1, C+2, H, W)
+    warped_packed = kornia.geometry.transform.warp_perspective(
+        packed,
+        H_total.unsqueeze(0),
+        dsize=(ch, cw),
+        mode='nearest',
+        padding_mode='zeros',
+    )
+
+    warped = warped_packed[:, :c_img].to(canvas.dtype)
+    warped_mask = warped_packed[:, c_img:c_img + 1]
+    warped_tool_mask = warped_packed[:, c_img + 1:c_img + 2]
 
     # Bool Logic
     wm_bool = warped_mask > 0.5 # currentがいる領域
@@ -534,15 +527,9 @@ def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy,
         # grad maskを反転
         grad_mask = 1 - grad_mask
         # Approximate Distance Transform using Kornia
-        dist_transform = fast_gradient_mask(grad_mask, radius=201)
+        dist_transform = fast_gradient_mask(grad_mask, radius=cfg.gradient_radius)
         dist_transform = 1 - dist_transform
-        plt.imshow(dist_transform.cpu().numpy().squeeze())
-        plt.show()
-        
-        #dist_transform = kornia.contrib.distance_transform(grad_mask)
-        #plt.imshow(dist_transform.cpu().numpy().squeeze())
-        #plt.show()
-        
+
         # デバッグ: 最大値が0より大きいか確認
         # print(f"Max distance: {dist_transform.max().item()}")
         if dist_transform.max() > 0:
@@ -559,7 +546,6 @@ def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy,
         )
         blended_alpha = alpha_overlap * warped_grad_alpha
         
-        # --- ここからは前回の修正と同じ（可読性のため直接代入を使用） ---
         overlap_expanded = overlap.expand_as(canvas)       
         alpha_expanded = blended_alpha.expand_as(canvas)   
         
@@ -668,12 +654,14 @@ def shear_angle_from_homography(H: torch.Tensor) -> float:
     A = H[:2, :2] / H[2, 2]
     Q, R = torch.linalg.qr(A.to(torch.float32)) # CPU for QR usually safer/faster for 3x3
     k = R[0, 1] / (R[1, 1] + 1e-8)
-    return float(abs(np.degrees(np.arctan(k.cpu().item()))))
+    rad = torch.atan(k).abs()
+    return torch.rad2deg(rad).item()
 
 
 def rotate_angle_from_homography(H: torch.Tensor) -> float:
     """Return absolute rotation angle (degrees)."""
-    return float(abs(np.degrees(np.arctan2(H[1, 0].item(), H[0, 0].item()))))
+    rad = torch.atan2(H[1, 0], H[0, 0]).abs()
+    return torch.rad2deg(rad).item()
 
 
 def scale_factor_from_homography(H: torch.Tensor) -> float:
@@ -738,24 +726,17 @@ def reset_canvas_orientation(canvas: torch.Tensor, canvas_mask: torch.Tensor, H_
     M = P_new @ H_old_inv
     
     # 4. Warp
-    warped_canvas = kornia.geometry.transform.warp_perspective(
-        canvas.float(),
-        M.unsqueeze(0),
-        dsize=(ch, cw),
-        mode='bilinear',
-        padding_mode='zeros'
+
+    packed = torch.cat([canvas, canvas_mask], dim=1).float()
+    warped_packed = kornia.geometry.transform.warp_perspective(
+        packed, M.unsqueeze(0), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
     ).to(canvas.dtype)
-    
-    warped_mask = None
-    if canvas_mask is not None:
-        warped_mask = kornia.geometry.transform.warp_perspective(
-            canvas_mask.float(),
-            M.unsqueeze(0),
-            dsize=(ch, cw),
-            mode='nearest',
-            padding_mode='zeros'
-        )
-        warped_mask = (warped_mask > 0).to(torch.uint8) * 255
+
+    canvas_chs = canvas.shape[1]
+    mask_chs = canvas_mask.shape[1]
+    warped_canvas = warped_packed[:, :canvas_chs]
+    warped_mask = warped_packed[:, canvas_chs:canvas_chs + mask_chs]
+    warped_mask = (warped_mask > 0).to(torch.uint8) * 255
     
     return warped_canvas, warped_mask, (offset_x, offset_y)
 
@@ -886,15 +867,6 @@ def paste_current_to_canvas_forward_poisson(canvas, canvas_mask, H_to_canvas, of
 
     # --- 2. Warp実行 ---
     ch, cw = canvas.shape[-2:]
-    
-    warped = kornia.geometry.transform.warp_perspective(
-        img_to_warp.float(), 
-        H_total.unsqueeze(0), 
-        dsize=(ch, cw), 
-        mode='nearest', 
-        padding_mode='zeros'
-    )
-    warped = warped.to(canvas.dtype)
 
     # Mask生成
     mask = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device)
@@ -908,21 +880,28 @@ def paste_current_to_canvas_forward_poisson(canvas, canvas_mask, H_to_canvas, of
         mask[:, -trim_px:] = 0
         
     mask_b = mask.unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
-    warped_mask = kornia.geometry.transform.warp_perspective(
-        mask_b, 
-        H_total.unsqueeze(0), 
-        dsize=(ch, cw), 
-        mode='nearest'
-    )
-    
+
+    # ---- Batch warp (image + geometry mask + tool mask) to reduce overhead ----
+    # All share H_total, dsize and nearest mode -> pack into channels and warp once.
     if resized_mask is not None:
         rm_b = resized_mask.float().unsqueeze(0)
-        if rm_b.dim() == 3: rm_b = rm_b.unsqueeze(0)
-        warped_tool_mask = kornia.geometry.transform.warp_perspective(
-            rm_b, H_total.unsqueeze(0), dsize=(ch, cw), mode='nearest'
-        )
+        if rm_b.dim() == 3:
+            rm_b = rm_b.unsqueeze(0)  # (1, 1, H, W)
     else:
-        warped_tool_mask = torch.zeros((1, 1, ch, cw), device=device)
+        rm_b = torch.zeros_like(mask_b)
+
+    c_img = img_to_warp.shape[1]
+    packed = torch.cat([img_to_warp.float(), mask_b, rm_b], dim=1)  # (1, C+2, H, W)
+    warped_packed = kornia.geometry.transform.warp_perspective(
+        packed,
+        H_total.unsqueeze(0),
+        dsize=(ch, cw),
+        mode='nearest',
+        padding_mode='zeros',
+    )
+    warped = warped_packed[:, :c_img].to(canvas.dtype)
+    warped_mask = warped_packed[:, c_img:c_img + 1]
+    warped_tool_mask = warped_packed[:, c_img + 1:c_img + 2]
 
     # 領域判定
     wm_bool = warped_mask > 0.5 
@@ -1074,13 +1053,8 @@ def paste_current_to_canvas_forward_multiband(
         img_to_warp.masked_fill_(resized_mask > 0, 0)
 
     ch, cw = canvas.shape[-2:]
-    
-    # Warp Image
-    warped = kornia.geometry.transform.warp_perspective(
-        img_to_warp.float(), H_total.unsqueeze(0), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
-    ).to(canvas.dtype)
 
-    # Warp Masks
+    # Warp Masks (geometry mask + tool mask)
     mask = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device)
     if resized_mask is not None:
         mask[resized_mask.squeeze(0) > 0] = 0
@@ -1088,18 +1062,24 @@ def paste_current_to_canvas_forward_multiband(
         mask[:trim_px, :] = 0; mask[-trim_px:, :] = 0; mask[:, :trim_px] = 0; mask[:, -trim_px:] = 0
         
     mask_b = mask.unsqueeze(0).unsqueeze(0)
-    warped_mask = kornia.geometry.transform.warp_perspective(
-        mask_b, H_total.unsqueeze(0), dsize=(ch, cw), mode='nearest'
-    )
-    
+
+    # ---- Batch warp (image + geometry mask + tool mask) to reduce overhead ----
+    # All share H_total, dsize and nearest mode -> pack into channels and warp once.
     if resized_mask is not None:
         rm_b = resized_mask.float().unsqueeze(0)
-        if rm_b.dim() == 3: rm_b = rm_b.unsqueeze(0)
-        warped_tool_mask = kornia.geometry.transform.warp_perspective(
-            rm_b, H_total.unsqueeze(0), dsize=(ch, cw), mode='nearest'
-        )
+        if rm_b.dim() == 3:
+            rm_b = rm_b.unsqueeze(0)  # (1, 1, H, W)
     else:
-        warped_tool_mask = torch.zeros((1, 1, ch, cw), device=device)
+        rm_b = torch.zeros_like(mask_b)
+
+    c_img = img_to_warp.shape[1]
+    packed = torch.cat([img_to_warp.float(), mask_b, rm_b], dim=1)  # (1, C+2, H, W)
+    warped_packed = kornia.geometry.transform.warp_perspective(
+        packed, H_total.unsqueeze(0), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
+    )
+    warped = warped_packed[:, :c_img].to(canvas.dtype)
+    warped_mask = warped_packed[:, c_img:c_img + 1]
+    warped_tool_mask = warped_packed[:, c_img + 1:c_img + 2]
 
     # Logic Masks (Binary)
     wm_bool = warped_mask > 0.5
@@ -1140,28 +1120,6 @@ def paste_current_to_canvas_forward_multiband(
             
             # Base Mask from Geometry
             roi_mask = valid_new_region[..., y_min:y_max, x_min:x_max].float()
-
-            # --- 修正点: マスクの境界処理 (Erosion & Blur) ---
-            if roi_mask.dim() == 3: roi_mask = roi_mask.unsqueeze(0) # (1, 1, H, W)
-            
-            # 1. Erosion: 境界を内側に削る (枠線やTool境界のゴミを除去)
-            # kernel size 3x3 or 5x5
-            if mask_erosion_iter > 0:
-                # カーネルを作成 (deviceを合わせる)
-                kernel = torch.ones(3, 3, device=device, dtype=roi_mask.dtype)
-                
-                for _ in range(mask_erosion_iter):
-                    roi_mask = kornia.morphology.erosion(
-                        roi_mask, 
-                        kernel, 
-                        border_type='geodesic', 
-                        border_value=0.0, 
-                        max_val=1.0
-                    )
-            # 2. Gaussian Blur: 境界を滑らかにする (ピラミッドの高周波でのシームレス化)
-            # kernel_sizeは奇数である必要があります (例: (9, 9))
-            k_size = int(2 * round(2 * mask_blur_sigma) + 1)
-            roi_mask = kornia.filters.gaussian_blur2d(roi_mask, (k_size, k_size), (mask_blur_sigma, mask_blur_sigma))
             
             # マスクの強度が下がりすぎないように正規化する場合もありますが、
             # ブレンド用としては0~1のグラデーションが重要なのでそのままでOK
@@ -1191,21 +1149,31 @@ def paste_current_to_canvas_forward_multiband(
             # overlap領域なので、再構築誤差を隠すためにもマスク合成推奨
             canvas_crop = canvas[..., y_min:y_max, x_min:x_max]
             
-            # 書き戻し用のマスクも ROI mask (blurred) を利用
-            update_weight = roi_mask
-            if update_weight.shape[-2:] != canvas_crop.shape[-2:]:
-                 update_weight = F.interpolate(update_weight, size=canvas_crop.shape[-2:], mode='bilinear')
+            paste_alpha_radius = int(getattr(cfg, "gradient_radius", 201))
             
-            # 完全に新しい領域(only_new)は上で処理済みだが、overlap内にも「元が0だった」場所があるかもしれない
-            # ここではシンプルにMultibandの結果を信頼して書き込む
-            # ただし、Erosionで削った部分は書き込まれないので、Canvasの古い情報が残る（これが狙い）
+            roi_mask_bin = (roi_mask > 0.5).float()
+            inv_mask = 1.0 - roi_mask_bin  # outside=1, inside=0
+            # ROI crop境界も「外側」とみなして必ずフェード帯ができるようにする
+            inv_mask[..., 0, :] = 1.0
+            inv_mask[..., -1, :] = 1.0
+            inv_mask[..., :, 0] = 1.0
+            inv_mask[..., :, -1] = 1.0
+            
+            # fast_gradient_mask は「1の領域から外側に減衰」なので、反転してROI内側へ増加するalphaにする
+            h_roi, w_roi = inv_mask.shape[-2:]
+            paste_alpha_radius = int(min(paste_alpha_radius, max(1, min(h_roi, w_roi) - 1)))
+            dist_out = fast_gradient_mask(inv_mask, radius=paste_alpha_radius)
+            grad_in = 1.0 - dist_out  # outside≈0, inside→1
+            
+            # roi_mask（将来のblur/erosionなど）も掛けて、境界のカットを避ける
+            update_weight = torch.clamp(grad_in * roi_mask, 0.0, 1.0)
+            if update_weight.shape[-2:] != canvas_crop.shape[-2:]:
+                update_weight = F.interpolate(update_weight, size=canvas_crop.shape[-2:], mode='bilinear', align_corners=False)
             
             blended_result = canvas_crop * (1.0 - update_weight) + roi_blended.to(canvas.dtype) * update_weight
             canvas[..., y_min:y_max, x_min:x_max] = blended_result
 
-    # Update Mask logic
-    # マスク更新は「幾何学的に新しい画像が存在する場所」なので valid_new_region を使う
-    # (Erosion前の領域をマスクとして記録しておかないと、次回の判定で隙間ができる可能性があるため)
+    # Update Mask
     canvas_mask[valid_new_region] = 255
     
     return canvas, canvas_mask
@@ -1242,3 +1210,27 @@ def fast_gradient_mask(mask: torch.Tensor, radius: int, scale_factor: float = 0.
     grad_mask = F.interpolate(grad_small, size=(h, w), mode='bilinear', align_corners=False)
     
     return torch.clamp(grad_mask, 0.0, 1.0)
+
+def laplacian_var(img: torch.Tensor) -> torch.Tensor:
+    """
+    Calculates the variance of the Laplacian of an image in PyTorch.
+    Equivalent to cv2.Laplacian(img, cv2.CV_64F).var()
+    Args:
+        img (torch.Tensor): Input image of shape (1, 3, H, W) or (B, C, H, W)
+    
+    Returns:
+        torch.Tensor: The variance scalar.
+    """
+    # 1. Define the standard Laplacian kernel
+    kernel = torch.tensor([
+        [0, 1, 0], 
+        [1, -4, 1], 
+        [0, 1, 0]
+    ], dtype=img.dtype, device=img.device)
+
+    # 2. Reshape kernel to (Out, In/Groups, kH, kW)
+    c = img.shape[1]
+    kernel = kernel.view(1, 1, 3, 3).repeat(c, 1, 1, 1)
+    # 3. Apply Convolution
+    laplacian = F.conv2d(img, kernel, padding=1, groups=c)
+    return laplacian.var(unbiased=False)

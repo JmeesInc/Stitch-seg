@@ -2,18 +2,19 @@ import torch
 
 
 DEFAULT_CFG_VALUES = {
-    "enable_depth_mask": False,
+    "enable_depth_mask": True,
     "enable_flow_translation": False,
     "enable_motion_mask": False,
     "equalize_hist_rgb": False,
     "stride": 1,
-    "method": "feature",
+    "method": "pyramid",#feature, pyramid, poisson
     "canvas_superres_scale": 1,
     "canvas_scale_x": 3,
     "canvas_scale_y": 3,
     "alpha_overlap": 0.95,
+    "gradient_radius": 201,
     "canvas_border_trim_px": 12,
-    "laplacian_var_min": 30.0,
+    "laplacian_var_min": 60, # if turn off the filtering, set to 0
     "reset_shear_angle": 15.0,
     "reset_rotate_angle": 15.0,
     "reset_scale_factor": 2.0,

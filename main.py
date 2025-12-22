@@ -1,7 +1,7 @@
 """Run segmentation on a stitched canvas using StitchInferencer."""
 import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 from typing import Optional
 
 import albumentations as A
@@ -14,8 +14,8 @@ import segmentation_models_pytorch as smp
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from stitch_seg import StitchInferencer
-
+from stitch_seg import StitchInferencerDev as StitchInferencer
+#from stitch_seg import StitchInferencer
 import time
 import cProfile
 import pstats
@@ -24,17 +24,20 @@ import pstats
 class CFG:
     video_path = "/mnt/data/data11/share/TLH/standardized_videos/001510725.mp4"
     start_frame = 122000
-    end_frame = 122500
-    segmentation_weights =  "checkpoint/best.pth"
-    output_dir = "check"
-    apply_ellipse_mask = True
-    segmentation_weights = "/mnt/devices/dl1/in-data/data3/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
+    end_frame = 122300
+    #segmentation_weights =  "checkpoint/best.pth"
+    output_dir = "1217_test"
+    method = "feature"
+    apply_ellipse_mask = False
+    laplacian_var_min = 60
+    #segmentation_weights = "/mnt/devices/dl1/in-data/data3/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
     num_classes = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     debug = True
     debug_dir = "check"
-    debug_video_filename = "fast_grad.mp4"
+    method = "dev"
+    debug_video_filename = "blur_reset.mp4"
 
 class CanvasSegModel(nn.Module):
     def __init__(self, cfg):
@@ -52,8 +55,9 @@ class CanvasSegModel(nn.Module):
         ).to(cfg.device)
 
         # 重みのロード
-        state = torch.load(cfg.segmentation_weights, map_location=cfg.device)
-        self.model.load_state_dict(state, strict=True)
+        #state = torch.load(cfg.segmentation_weights, map_location=cfg.device)
+        #self.model.load_state_dict(state, strict=True)
+        # 全部0にする
         self.model.eval()
         
         self.device = cfg.device
@@ -213,7 +217,11 @@ def build_debug_panel(labeled_images, frame_shape):
         panels.append(np.zeros((h, w, 3), dtype=np.uint8))
     row1 = np.hstack(panels[:3])
     row2 = np.hstack(panels[3:6])
-    return np.vstack([row1, row2])
+    stacked = np.vstack([row1, row2])
+    new_h = int(stacked.shape[0] * 0.33)
+    new_w = int(stacked.shape[1] * 0.33)
+    resized = cv2.resize(stacked, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    return resized
 
 
 # --- Debug video writer (for saving panels as a video) ---

@@ -12,3 +12,5 @@ cjec
 
 # Virtual environments
 .venv
+
+*.mp4

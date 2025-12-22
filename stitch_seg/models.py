@@ -25,7 +25,7 @@ def init_feature_pipeline(cfg):
     return extractor, matcher
 
 
-def load_tool_detector(cfg):
+def load_masking_model(cfg):
     seg_model = smp.Unet(
         encoder_name="tu-convnext_base.dinov3_lvd1689m",
         encoder_weights="imagenet",
