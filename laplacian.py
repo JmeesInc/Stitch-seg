@@ -63,3 +63,46 @@ for frame_idx in tqdm(range(start_frame, end_frame)):
     out.write(frame_vis)
 out.release()
 cap.release()
+
+
+
+
+def extract_scope_mask(self, torch_frame: torch.Tensor):
+    """
+    画像から内視鏡の円/楕円領域のパラメータを推定する
+    Return: mask (x, y) - 1が内視鏡視野
+    """
+    import kornia
+    gray = kornia.color.rgb_to_grayscale(torch_frame)
+    # 1. 二値化 (閾値は環境に合わせて調整。10-30あたりが一般的)
+    thresh = (gray > 15).float()
+    # 2. モルフォロジー演算（ノイズ除去と穴埋め）
+    thresh = kornia.morphology.opening(thresh, self.scope_kernel)
+    thresh = kornia.morphology.closing(thresh, self.scope_kernel)
+    # 4. 円のパラメータ推定 (モーメント法による中心と半径の推定)
+        # 輪郭抽出(findContours)の代わりに、1が立っている座標の重心を求める
+    # 座標グリッドの生成
+    B, C, H, W = thresh.shape
+    y_coords, x_coords = torch.meshgrid(
+        torch.arange(H, device=thresh.device),
+        torch.arange(W, device=thresh.device),
+        indexing='ij'
+    )
+    
+    # 重心 (Center of Mass) の計算
+    sum_thresh = thresh.sum()
+    if sum_thresh == 0:
+        return None
+        
+    center_y = (y_coords * thresh).sum() / sum_thresh
+    center_x = (x_coords * thresh).sum() / sum_thresh
+    
+    # 半径の推定 (面積 S = πr^2 から逆算、または重心からの最大距離)
+    # ここでは面積から逆算するのがノイズに強く安定します
+    radius = torch.sqrt(sum_thresh / torch.pi) - self.cfg.canvas_border_trim_px
+    
+    # 5. マスクの再生成 (円の外側を1にする)
+    dist_sq = (x_coords - center_x)**2 + (y_coords - center_y)**2
+    final_mask = (dist_sq > radius**2).long() # 円の外側を1にする
+    
+    self.ellipse_mask = final_mask.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]

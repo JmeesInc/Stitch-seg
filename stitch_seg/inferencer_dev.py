@@ -105,39 +105,30 @@ class StitchInferencerDev(nn.Module):
         画像から内視鏡の円/楕円領域のパラメータを推定する
         Return: mask (x, y) - 1が内視鏡視野
         """
-        gray = kornia.color.rgb_to_grayscale(torch_frame)
+        gray = cv2.cvtColor(torch_frame[0].permute(1, 2, 0).cpu().numpy().astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        mask = np.zeros_like(gray)
+        
         # 1. 二値化 (閾値は環境に合わせて調整。10-30あたりが一般的)
-        thresh = (gray > (15 / 255.0)).float()
+        _, thresh = cv2.threshold(gray, 15, 255, cv2.THRESH_BINARY)
+        
         # 2. モルフォロジー演算（ノイズ除去と穴埋め）
-        thresh = kornia.morphology.opening(thresh, self.scope_kernel)
-        thresh = kornia.morphology.closing(thresh, self.scope_kernel)
-        # 4. 円のパラメータ推定 (モーメント法による中心と半径の推定)
-            # 輪郭抽出(findContours)の代わりに、1が立っている座標の重心を求める
-        # 座標グリッドの生成
-        B, C, H, W = thresh.shape
-        y_coords, x_coords = torch.meshgrid(
-            torch.arange(H, device=thresh.device),
-            torch.arange(W, device=thresh.device),
-            indexing='ij'
-        )
+        kernel = np.ones((5,5), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
         
-        # 重心 (Center of Mass) の計算
-        sum_thresh = thresh.sum()
-        if sum_thresh == 0:
+        # 3. 輪郭抽出
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
             return None
-            
-        center_y = (y_coords * thresh).sum() / sum_thresh
-        center_x = (x_coords * thresh).sum() / sum_thresh
-        
-        # 半径の推定 (面積 S = πr^2 から逆算、または重心からの最大距離)
-        # ここでは面積から逆算するのがノイズに強く安定します
-        radius = torch.sqrt(sum_thresh / torch.pi) - self.cfg.canvas_border_trim_px
-        
-        # 5. マスクの再生成 (円の外側を1にする)
-        dist_sq = (x_coords - center_x)**2 + (y_coords - center_y)**2
-        final_mask = (dist_sq > radius**2).long() # 円の外側を1にする
-        
-        self.ellipse_mask = final_mask.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+        max_contour = max(contours, key=cv2.contourArea)
+        (x, y), radius = cv2.minEnclosingCircle(max_contour)
+        radius -= self.cfg.canvas_border_trim_px
+        mask = cv2.circle(mask, (int(x), int(y)), int(radius), 1, -1)
+        mask = np.ones_like(mask) - mask
+        self.ellipse_mask = torch.from_numpy(mask).to(self.device).unsqueeze(0).unsqueeze(0).to(torch.long)
+
+
 
 
     def preprocess_frame(self, frame: np.ndarray) -> torch.Tensor:
@@ -163,6 +154,8 @@ class StitchInferencerDev(nn.Module):
         if self.apply_ellipse_mask:
             if self.ellipse_mask is None:
                 self.extract_scope_mask(torch_frame)
+                cv2.imwrite("ellipse_mask.png", self.ellipse_mask.squeeze(0).squeeze(0).cpu().detach().numpy()*255.0)
+                cv2.imwrite("torch_frame.png", torch_frame.squeeze(0).permute(1, 2, 0).cpu().detach().numpy().astype(np.uint8))
 
         return torch_frame
 

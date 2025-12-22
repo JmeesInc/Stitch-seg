@@ -100,7 +100,7 @@ class StitchInferencer(nn.Module):
         self.last_canvas_crop = None
         self.last_canvas_bbox = None
     
-    def extract_scope_mask(self, torch_frame: torch.Tensor):
+    def extract_scope_mask_torch(self, torch_frame: torch.Tensor):
         """
         画像から内視鏡の円/楕円領域のパラメータを推定する
         Return: mask (x, y) - 1が内視鏡視野
@@ -138,6 +138,36 @@ class StitchInferencer(nn.Module):
         final_mask = (dist_sq > radius**2).long() # 円の外側を1にする
         
         self.ellipse_mask = final_mask.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
+    
+    def extract_scope_mask(self, torch_frame: torch.Tensor):
+        """
+        画像から内視鏡の円/楕円領域のパラメータを推定する
+        Return: mask (x, y) - 1が内視鏡視野
+        """
+        gray = cv2.cvtColor(torch_frame[0].permute(1, 2, 0).cpu().numpy().astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        mask = np.zeros_like(gray)
+        
+        # 1. 二値化 (閾値は環境に合わせて調整。10-30あたりが一般的)
+        _, thresh = cv2.threshold(gray, 15, 255, cv2.THRESH_BINARY)
+        
+        # 2. モルフォロジー演算（ノイズ除去と穴埋め）
+        kernel = np.ones((5,5), np.uint8)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # 3. 輪郭抽出
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return None
+        max_contour = max(contours, key=cv2.contourArea)
+        (x, y), radius = cv2.minEnclosingCircle(max_contour)
+        radius -= self.cfg.canvas_border_trim_px
+        mask = cv2.circle(mask, (int(x), int(y)), int(radius), 1, -1)
+        mask = np.ones_like(mask) - mask
+        self.ellipse_mask = torch.from_numpy(mask).to(self.device).unsqueeze(0).unsqueeze(0).to(torch.long)
+
+
 
 
     def preprocess_frame(self, frame: np.ndarray) -> torch.Tensor:
