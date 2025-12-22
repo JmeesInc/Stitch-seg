@@ -308,11 +308,9 @@ class StitchInferencer(nn.Module):
         warped_pred = warp_with_transform(canvas_pred, H_canvas_to_curr, (h, w), interpolation='nearest', border_mode='zeros')
 
         if self.cfg.apply_ellipse_mask: # ellipse maskの1の部分は0にする
-            warped_pred[:, 0, self.ellipse_mask] = 1
-            warped_pred[:, 1:, (1-self.ellipse_mask)] = 0
+            warped_pred[:, 0, :, :] = self.ellipse_mask.squeeze(0).float()*255.0
         if self.cfg.tool_class_ch is not None:
-            warped_pred[:, self.cfg.tool_class_ch, self.last_tool_mask.squeeze(0).squeeze(0)] = 1
-            warped_pred[:, :self.cfg.tool_class_ch, (1-self.last_tool_mask.squeeze(0).squeeze(0))] = 0
+            warped_pred[:, self.cfg.tool_class_ch, :, :] = self.last_tool_mask.squeeze(0).float()*255.0
         return warped_pred.squeeze(0) # (Classes, H, W)
     
     def first_frame(self, frame_u, tool_mask_raw, depth_mask_raw):
