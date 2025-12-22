@@ -22,22 +22,22 @@ import pstats
 
 
 class CFG:
-    video_path = "/mnt/data/data11/share/TLH/standardized_videos/001510725.mp4"
-    start_frame = 122000
-    end_frame = 122300
+    video_path = "/mnt/data/data4/shared/Cholecystostomy/Cholec80/videos/video09.mp4"
+    start_frame = 0
+    end_frame = 1000
     #segmentation_weights =  "checkpoint/best.pth"
     output_dir = "1217_test"
     method = "feature"
-    apply_ellipse_mask = False
+    apply_ellipse_mask = True
     laplacian_var_min = 60
-    #segmentation_weights = "/mnt/devices/dl1/in-data/data3/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
+    segmentation_weights = "/mnt/devices/dl1/in-data/data3/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
     num_classes = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     debug = True
-    debug_dir = "check"
+    debug_dir = "video"
     method = "dev"
-    debug_video_filename = "blur_reset.mp4"
+    debug_video_filename = "video09.mp4"
 
 class CanvasSegModel(nn.Module):
     def __init__(self, cfg):
@@ -55,9 +55,8 @@ class CanvasSegModel(nn.Module):
         ).to(cfg.device)
 
         # 重みのロード
-        #state = torch.load(cfg.segmentation_weights, map_location=cfg.device)
-        #self.model.load_state_dict(state, strict=True)
-        # 全部0にする
+        state = torch.load(cfg.segmentation_weights, map_location=cfg.device)
+        self.model.load_state_dict(state, strict=True)
         self.model.eval()
         
         self.device = cfg.device
@@ -329,7 +328,7 @@ def main():
                             ("model_input", model_input),
                             ("seg - stitched", overlay_stitched),
                             ("seg - original", overlay_direct),
-                            ('merge_mask',  inferencer.combined_mask_prev_stab.squeeze(0).squeeze(0).cpu().detach().numpy()),
+                            ('merge_mask',  inferencer.combined_mask_prev_raw.squeeze(0).squeeze(0).cpu().detach().numpy()),
                         ],
                         frame_vis.shape[:2] if frame_vis is not None else frame.shape[:2],
                     )

@@ -1,4 +1,5 @@
 import cv2
+from kornia.filters.blur_pool import blur_pool2d
 import numpy as np
 import torch
 import torch.nn as nn
@@ -39,7 +40,7 @@ from .stitch_utils_torch import (
 )
 
 
-class StitchInferencer(nn.Module):
+class StitchInferencerDev(nn.Module):
     """Stateful stitching engine that exposes stitched crops to a seg model.
 
     Flow summary:
@@ -65,6 +66,7 @@ class StitchInferencer(nn.Module):
         self.roi = None
         self.ellipse_mask = None
         self.use_roi = bool(getattr(cfg, "use_static_roi", True))
+        self.roi = None
         self.apply_ellipse_mask = bool(getattr(cfg, "apply_ellipse_mask", True))
         self.equalize_hist = bool(getattr(cfg, "equalize_hist_rgb", True))
 
@@ -75,10 +77,10 @@ class StitchInferencer(nn.Module):
         )
         self.depth_model = load_depth_model(cfg)
         self.extractor, self.matcher = init_feature_pipeline(cfg)
-        self.flow_model = ptlflow.get_model("neuflow2", "mixed").to(self.cfg.device)
-        self.flow_model.eval()
-        for param in self.flow_model.parameters():
-            param.requires_grad_(False)
+        
+        self.scope_kernel = torch.ones(5, 5, device=self.device)
+        self.last_model_input = None
+        self.last_model_output = None
 
         self.reset_state()
 
@@ -87,18 +89,14 @@ class StitchInferencer(nn.Module):
         self.canvas_memory = None # for step and update canvas
         self.canvas_mask = None # for model inference
         self.canvas_mask_memory = None # for step and update canvas
-        self.offset_xy = None
-        self.roi = None
+        self.canvas4model = None
+        self.canvas_mask4model = None
+        self.offset_xy = (0, 0)
         self.ellipse_mask = None
-        self.prev_flow_gray_raw = None
-        self.prev_flow_gray_stab = None
         self.prev_rgb_raw = None
-        self.prev_rgb_stab = None
         self.prev_feats = None
         self.prev_stab_transform = torch.eye(3, device=self.device)
         self.H_cum = torch.eye(3, device=self.device)
-        self.last_model_input = None
-        self.last_model_output = None
         self.last_canvas_crop = None
         self.last_canvas_bbox = None
     
@@ -107,28 +105,39 @@ class StitchInferencer(nn.Module):
         画像から内視鏡の円/楕円領域のパラメータを推定する
         Return: mask (x, y) - 1が内視鏡視野
         """
-        gray = cv2.cvtColor(torch_frame[0].permute(1, 2, 0).cpu().numpy().astype(np.uint8), cv2.COLOR_BGR2GRAY)
-        mask = np.zeros_like(gray)
-        
+        gray = kornia.color.rgb_to_grayscale(torch_frame)
         # 1. 二値化 (閾値は環境に合わせて調整。10-30あたりが一般的)
-        _, thresh = cv2.threshold(gray, 15, 255, cv2.THRESH_BINARY)
-        
+        thresh = (gray > (15 / 255.0)).float()
         # 2. モルフォロジー演算（ノイズ除去と穴埋め）
-        kernel = np.ones((5,5), np.uint8)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=2)
-        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel, iterations=2)
+        thresh = kornia.morphology.opening(thresh, self.scope_kernel)
+        thresh = kornia.morphology.closing(thresh, self.scope_kernel)
+        # 4. 円のパラメータ推定 (モーメント法による中心と半径の推定)
+            # 輪郭抽出(findContours)の代わりに、1が立っている座標の重心を求める
+        # 座標グリッドの生成
+        B, C, H, W = thresh.shape
+        y_coords, x_coords = torch.meshgrid(
+            torch.arange(H, device=thresh.device),
+            torch.arange(W, device=thresh.device),
+            indexing='ij'
+        )
         
-        # 3. 輪郭抽出
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
+        # 重心 (Center of Mass) の計算
+        sum_thresh = thresh.sum()
+        if sum_thresh == 0:
             return None
-        max_contour = max(contours, key=cv2.contourArea)
-        (x, y), radius = cv2.minEnclosingCircle(max_contour)
-        radius -= self.cfg.canvas_border_trim_px
-        mask = cv2.circle(mask, (int(x), int(y)), int(radius), 1, -1)
-        mask = np.ones_like(mask) - mask
-        self.ellipse_mask = torch.from_numpy(mask).to(self.device).unsqueeze(0).unsqueeze(0).to(torch.long)
+            
+        center_y = (y_coords * thresh).sum() / sum_thresh
+        center_x = (x_coords * thresh).sum() / sum_thresh
+        
+        # 半径の推定 (面積 S = πr^2 から逆算、または重心からの最大距離)
+        # ここでは面積から逆算するのがノイズに強く安定します
+        radius = torch.sqrt(sum_thresh / torch.pi) - self.cfg.canvas_border_trim_px
+        
+        # 5. マスクの再生成 (円の外側を1にする)
+        dist_sq = (x_coords - center_x)**2 + (y_coords - center_y)**2
+        final_mask = (dist_sq > radius**2).long() # 円の外側を1にする
+        
+        self.ellipse_mask = final_mask.unsqueeze(0).unsqueeze(0) # [1, 1, H, W]
 
 
     def preprocess_frame(self, frame: np.ndarray) -> torch.Tensor:
@@ -167,18 +176,6 @@ class StitchInferencer(nn.Module):
         gray = kornia.color.rgb_to_grayscale(rgb_tensor.float())
         return gray
 
-    def _ensure_mask_4d(self, mask: torch.Tensor):
-        if mask is None:
-            return None
-        if not isinstance(mask, torch.Tensor):
-            return mask
-        m = mask
-        if m.dim() == 2:
-            m = m.unsqueeze(0).unsqueeze(0)
-        elif m.dim() == 3:
-            m = m.unsqueeze(0)
-        return m
-
     def _predict_masks(self, frame_u: torch.Tensor):
         """
         input: (1, 3, H, W) RGB uint8/float
@@ -199,7 +196,7 @@ class StitchInferencer(nn.Module):
         
         if depth_tensor is not None:
             depth_tensor = torch.nn.functional.interpolate(depth_tensor, size=frame_u.shape[-2:], mode='bilinear', align_corners=False)
-            depth_mask = self.compute_depth_mask(depth_tensor)
+            depth_mask = compute_depth_mask(depth_tensor, self.cfg)
         else:
             depth_mask = None
         
@@ -238,22 +235,18 @@ class StitchInferencer(nn.Module):
         try:
             x1 = max(0, int(torch.floor(xs.min()).item()))
             y1 = max(0, int(torch.floor(ys.min()).item()))
-            x2 = min(self.canvas.shape[-1], int(torch.ceil(xs.max()).item()))
-            y2 = min(self.canvas.shape[-2], int(torch.ceil(ys.max()).item()))
+            x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
+            y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
         except Exception as e:
-            print(xs)
-            print(ys)
-            print(proj)
-            print(H, pts)
-            raise e
+            return None, None, None, None
             #return 0, 0, self.canvas.shape[-1], self.canvas.shape[-2]
         x1 = max(0, int(torch.floor(xs.min()).item()))
         y1 = max(0, int(torch.floor(ys.min()).item()))
-        x2 = min(self.canvas.shape[-1], int(torch.ceil(xs.max()).item()))
-        y2 = min(self.canvas.shape[-2], int(torch.ceil(ys.max()).item()))
+        x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
+        y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
         
         if x2 <= x1 or y2 <= y1:
-            return 0, 0, self.canvas.shape[-1], self.canvas.shape[-2]
+            return 0, 0, self.canvas4model.shape[-1], self.canvas4model .shape[-2]
         return x1, y1, x2, y2
     
     @torch.inference_mode()
@@ -261,22 +254,25 @@ class StitchInferencer(nn.Module):
         """
         Returns: Seg Map Tensor (Classes, H, W)
         """
-        source_canvas = self.canvas
+        source_canvas = self.canvas4model
         if self.model is None or source_canvas is None:
             return None
             
         x1, y1, x2, y2 = self._current_canvas_bbox(frame_shape)#TODO:現在は外接、内接でも良さそう
+        if x1 is None or y1 is None or x2 is None or y2 is None:
+            self.reset_state()
+            return torch.zeros((1, self.cfg.num_classes, frame_shape[0], frame_shape[1]), dtype=torch.float32, device=self.device)
         # Crop mask check
-        if self.canvas_mask is not None:
+        if self.canvas4model_mask is not None:
              # Basic check using nonzero
-             valid_indices = torch.nonzero(self.canvas_mask.squeeze())
+             valid_indices = torch.nonzero(self.canvas4model_mask.squeeze())
              if valid_indices.shape[0] > 0:
                  ymin_m, xmin_m = valid_indices.min(dim=0)[0]
                  ymax_m, xmax_m = valid_indices.max(dim=0)[0]
                  x1 = max(0, min(x1, int(xmin_m.item())))
                  y1 = max(0, min(y1, int(ymin_m.item())))
-                 x2 = min(self.canvas_mask.shape[-1], max(x2, int(xmax_m.item()) + 1))
-                 y2 = min(self.canvas_mask.shape[-2], max(y2, int(ymax_m.item()) + 1))
+                 x2 = min(self.canvas4model_mask.shape[-1], max(x2, int(xmax_m.item()) + 1))
+                 y2 = min(self.canvas4model_mask.shape[-2], max(y2, int(ymax_m.item()) + 1))
 
         crop = source_canvas[..., y1:y2, x1:x2]
         if crop.numel() == 0: return None
@@ -301,12 +297,60 @@ class StitchInferencer(nn.Module):
         
         # Warp back to current frame
         h, w = frame_shape
-        H_canvas_to_curr = torch.linalg.inv(self._current_to_canvas_h())
-        
+        H = self._current_to_canvas_h()
+        try:
+            H_canvas_to_curr = torch.linalg.inv(H)
+        except Exception as e:
+            print("reset canvas")
+            self.reset_state()
+            return torch.zeros((1, self.cfg.num_classes, frame_shape[0], frame_shape[1]), dtype=torch.float32, device=self.device)
         # Warp (1, Classes, H_canv, W_canv) -> (1, Classes, H, W)
         warped_pred = warp_with_transform(canvas_pred, H_canvas_to_curr, (h, w), interpolation='nearest', border_mode='zeros')
         return warped_pred.squeeze(0) # (Classes, H, W)
+    
+    def first_frame(self, frame_u, tool_mask_raw, depth_mask_raw):
+        if self.canvas4model is None:
+            _, _, h0, w0 = frame_u.shape
+            self.canvas_h = int(self.cfg.canvas_scale_y * h0 * self.cfg.canvas_superres_scale)
+            self.canvas_w = int(self.cfg.canvas_scale_x * w0 * self.cfg.canvas_superres_scale)
+            self.canvas4model = torch.zeros((1, 3, self.canvas_h, self.canvas_w), dtype=torch.float32, device=self.device)
+            self.canvas4model_mask = torch.zeros((1, 1, self.canvas_h, self.canvas_w), dtype=torch.uint8, device=self.device)
+            self.canvas = self.canvas4model.clone()
+            self.canvas_mask = self.canvas4model_mask.clone()
+            # Correct offset calculation based on UN-scaled dimensions
+            # canvas_w is scaled, so divide by scale first
+            scale = getattr(self.cfg, "canvas_superres_scale", 1.0)
+            base_cw = int(self.canvas_w / scale) if scale > 0 else self.canvas_w
+            base_ch = int(self.canvas_h / scale) if scale > 0 else self.canvas_h
+            self.offset_xy = (base_cw // 2 - w0 // 2, base_ch // 2 - h0 // 2)
 
+            self.prev_rgb_raw = frame_u.clone()
+            self.prev_stab_transform = torch.eye(3, device=self.device)
+            combined_mask_raw = merge_masks(tool_mask_raw, depth_mask_raw)
+            self.combined_mask_prev_raw = combined_mask_raw
+            # Features
+            tensor_lg = self._to_lightglue_gray(frame_u)
+            with torch.no_grad():
+                feats = self.extractor.extract(tensor_lg)
+            self.prev_feats = filter_features_by_mask(feats, self.combined_mask_prev_raw) if self.combined_mask_prev_raw is not None else feats
+            self.H_cum = torch.eye(3, device=self.device)
+            # Paste
+            if self.cfg.method == "pyramid":
+                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_multiband(
+                    self.canvas, self.canvas_mask, self.H_cum, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
+                )
+            elif self.cfg.method == "poisson":
+                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_poisson(
+                    self.canvas, self.canvas_mask, self.H_cum, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
+                )
+            else:
+                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward(
+                    self.canvas, self.canvas_mask, self.H_cum, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
+                )
+            self.canvas = self.canvas4model.clone()
+            self.canvas_mask = self.canvas4model_mask.clone()
+            
+    
     def step_canvas(self, frame_u: torch.Tensor):
         """
         Main logic step.
@@ -316,51 +360,9 @@ class StitchInferencer(nn.Module):
             # === 1. Predict Masks ===
             tool_mask_raw, depth_mask_raw = self._predict_masks(frame_u)
             # === 2. Convert to Grayscale for Flow ===
-            curr_flow_gray_raw = kornia.color.rgb_to_grayscale(frame_u) # (1, 1, H, W)
             # === 3. Initialization ===
-            if self.canvas is None:
-                _, _, h0, w0 = frame_u.shape
-                self.canvas_h = int(self.cfg.canvas_scale_y * h0 * self.cfg.canvas_superres_scale)
-                self.canvas_w = int(self.cfg.canvas_scale_x * w0 * self.cfg.canvas_superres_scale)
-                self.canvas = torch.zeros((1, 3, self.canvas_h, self.canvas_w), dtype=torch.float32, device=self.device)
-                self.canvas_mask = torch.zeros((1, 1, self.canvas_h, self.canvas_w), dtype=torch.uint8, device=self.device)
-                
-                # Correct offset calculation based on UN-scaled dimensions
-                # canvas_w is scaled, so divide by scale first
-                scale = getattr(self.cfg, "canvas_superres_scale", 1.0)
-                base_cw = int(self.canvas_w / scale) if scale > 0 else self.canvas_w
-                base_ch = int(self.canvas_h / scale) if scale > 0 else self.canvas_h
-                self.offset_xy = (base_cw // 2 - w0 // 2, base_ch // 2 - h0 // 2)
-                
-                self.prev_flow_gray_raw = curr_flow_gray_raw.clone()
-                self.prev_flow_gray_stab = curr_flow_gray_raw.clone()
-                self.prev_rgb_raw = frame_u.clone()
-                self.prev_rgb_stab = frame_u.clone()
-                self.prev_stab_transform = torch.eye(3, device=self.device)
-                combined_mask_raw = merge_masks(tool_mask_raw, depth_mask_raw)
-                self.combined_mask_prev_raw = combined_mask_raw
-                self.combined_mask_prev_stab = combined_mask_raw.clone() if combined_mask_raw is not None else None
-                # Features
-                tensor_lg = self._to_lightglue_gray(frame_u)
-                with torch.no_grad():
-                    feats = self.extractor.extract(tensor_lg)
-                self.prev_feats = filter_features_by_mask(feats, self.combined_mask_prev_stab) if self.combined_mask_prev_stab is not None else feats
-                self.H_cum = torch.eye(3, device=self.device)
-                # Paste
-                if self.cfg.method == "pyramid":
-                    self.canvas, self.canvas_mask = paste_current_to_canvas_forward_multiband(
-                        self.canvas, self.canvas_mask, self.H_cum, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
-                    )
-                elif self.cfg.method == "poisson":
-                    self.canvas, self.canvas_mask = paste_current_to_canvas_forward_poisson(
-                        self.canvas, self.canvas_mask, self.H_cum, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
-                    )
-                else:
-                    self.canvas, self.canvas_mask = paste_current_to_canvas_forward(
-                        self.canvas, self.canvas_mask, self.H_cum, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
-                    )
-                self.canvas_invalid_mask = invert_canvas_valid_mask(self.canvas_mask)
-                self.canvas_feats = extract_canvas_features(self.extractor, self.canvas, self.cfg, self.canvas_invalid_mask)
+            if self.canvas4model is None:
+                self.first_frame(frame_u, tool_mask_raw, depth_mask_raw)
                 return
 
             # === 5. Mask Merge ===
@@ -376,32 +378,46 @@ class StitchInferencer(nn.Module):
             H_cum_curr = self.H_cum
             if curr_feats is not None and self.prev_feats is not None:
                 self.prev_feats['keypoints'] = self.prev_feats['keypoints'].to(torch.float32)
-                H_rel = self.estimate_homography_from_features(
+                #H_rel = self.estimate_homography_from_features(
+                #    self.prev_feats, curr_feats
+                #)
+                H_inv = self.estimate_homography_from_features(
                     curr_feats, self.prev_feats
                 )
-                if H_rel is not None:
-                    if isinstance(H_rel, np.ndarray):
-                        H_rel_t = torch.from_numpy(H_rel).to(self.device, dtype=torch.float32)
-                    else:
-                        H_rel_t = H_rel.to(torch.float32)
-                    H_cum_curr = self.H_cum @ H_rel_t
+                #if H_rel is not None:
+                #    if isinstance(H_rel, np.ndarray):
+                #        H_rel_t = torch.from_numpy(H_rel).to(self.device, dtype=torch.float32)
+                #    else:
+                #        H_rel_t = H_rel.to(torch.float32)
+                    
+                    # H_rel maps prev_raw -> curr_stab (p_stab = H_rel @ p_prev)
+                    # We want H_{curr_raw -> prev_raw} (p_prev = H_step @ p_curr)
+                    # p_stab = T_curr @ p_curr
+                    # T_curr @ p_curr = H_rel @ p_prev
+                    # p_prev = inv(H_rel) @ T_curr @ p_curr
+                    #H_cum_curr = self.H_cum @ torch.linalg.inv(H_rel_t)
+                if isinstance(H_inv, tuple):
+                    print("first frame")
+                    self.reset_state()
+                    self.first_frame(frame_u, tool_mask_raw, depth_mask_raw)
+                    return
+                H_cum_curr = self.H_cum @ H_inv
 
             # === 8. Paste Current Frame to Canvas (update canvas) ===
-            # self.canvasはblurでも更新、次回は使わない
-            #　self.canvas_memoryはblurなしでは更新しない、次回は使う
+            # self.canvas4modelはblurでも更新、次回は使わない
+            #　self.canvasはblurなしでは更新しない、次回は使う
             if self.cfg.method == "pyramid":
-                self.canvas, self.canvas_mask = paste_current_to_canvas_forward_multiband(
+                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_multiband(
                     self.canvas, self.canvas_mask, H_cum_curr, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
                 )
             elif self.cfg.method == "poisson":
-                self.canvas, self.canvas_mask = paste_current_to_canvas_forward_poisson(
+                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_poisson(
                     self.canvas, self.canvas_mask, H_cum_curr, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
                 )
             else:
-                self.canvas, self.canvas_mask = paste_current_to_canvas_forward(
+                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward(
                     self.canvas, self.canvas_mask, H_cum_curr, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
                 )
-            self.canvas_invalid_mask = invert_canvas_valid_mask(self.canvas_mask)
             
             # Transform current features to raw space for next iteration
             self.prev_feats = curr_feats
@@ -431,16 +447,20 @@ class StitchInferencer(nn.Module):
                  rot > getattr(self.cfg, "reset_rotate_angle", 15.0) or
                  scale > getattr(self.cfg, "reset_scale_factor", 2.0))
 
-        if reset:
-            H_cum_curr = H_cum_curr.to(torch.float32)
-            self.canvas, self.canvas_mask, self.offset_xy = reset_canvas_orientation(
-                self.canvas, self.canvas_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, self.offset_xy
-            )
-            self.H_cum = torch.eye(3, device=self.device)
-            self.canvas_invalid_mask = invert_canvas_valid_mask(self.canvas_mask)
+        blur = laplacian_var(frame_u.float()) < self.cfg.laplacian_var_min
+        
+        if not blur:
+            if reset:
+                H_cum_curr = H_cum_curr.to(torch.float32)
+                self.canvas4model, self.canvas4model_mask, self.offset_xy = reset_canvas_orientation(
+                    self.canvas4model, self.canvas4model_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, self.offset_xy
+                )
+                self.H_cum = torch.eye(3, device=self.device)
+            self.canvas = self.canvas4model.clone()
+            self.canvas_mask = self.canvas4model_mask.clone()
+            #print(laplacian_var(frame_u.float()), self.cfg.laplacian_var_min, "canvas update")
         
         # === 13. Update State ===
-        self.prev_flow_gray_raw = curr_flow_gray_raw
         self.prev_rgb_raw = frame_u.clone()
         self.combined_mask_prev_raw = combined_mask_raw if combined_mask_raw is not None else None
         self.prev_stab_transform = H_cum_curr
@@ -488,151 +508,6 @@ class StitchInferencer(nn.Module):
             img = img / 255.0
             
         return img
-
-    def compute_flow(self, prev_tensor: torch.Tensor, curr_tensor: torch.Tensor):
-        """
-        NeuFlow2推論の実行
-        prev_tensor, curr_tensor: torch.Size([1, 3, 1080, 1920]), torch.Size([1, 3, 1080, 1920])
-        Return: flow (H, W, 2) : (1080, 1920, 2)
-        """
-
-        # 前処理とスタック
-        img1 = self._preprocess(prev_tensor)
-        img2 = self._preprocess(curr_tensor)
-        
-        # (1, 2, 3, H, W) の形式を作成
-        images = torch.stack([img1, img2], dim=1)
-        
-        inputs = {"images": images}
-        
-        with torch.no_grad():
-            preds = self.flow_model(inputs)
-            
-        # Flow取得: (1, 1, 2, H, W) -> (H, W, 2)
-        # 処理を一貫させるためGPU上のTensorのまま返す
-        flow = preds["flows"].squeeze(0).squeeze(0).permute(1, 2, 0)
-        return flow
-    def _morphology_close_open(self, mask: torch.Tensor, kernel_size: int = 5):
-        """
-        korniaを使用したモルフォロジー演算 (Closing -> Opening)
-        mask: (H, W) or (1, H, W) range [0, 1] (float or bool)
-        """
-        # Korniaは (B, C, H, W) の形状を期待するため整形
-        if mask.dim() == 2:
-            m = mask.view(1, 1, mask.shape[0], mask.shape[1]).float()
-        elif mask.dim() == 3:
-            m = mask.unsqueeze(0).float()
-        else:
-            m = mask.float()
-
-        # カーネルの作成 (すべて1ならRect形状になります)
-        kernel = torch.ones(kernel_size, kernel_size, device=mask.device)
-
-        m_closed = kornia.morphology.closing(m, kernel)
-        m_opened = kornia.morphology.opening(m_closed, kernel)
-
-        # 元の (H, W) 形状に戻して bool 化
-        return m_opened.squeeze() > 0.5
-    def estimate_camera_shift(self, prev_img: torch.Tensor, curr_img: torch.Tensor, base_mask: torch.Tensor = None):
-        """
-        カメラのシフト量を推定 (Torch完結版)
-        Return: (dx, dy) as float tuple
-        """
-        if prev_img is None or curr_img is None:
-            return (0.0, 0.0)
-
-        flow = self.compute_flow(prev_img, curr_img)
-        dx = flow[..., 0]
-        dy = flow[..., 1]
-
-        # マスク処理
-        h, w = prev_img.shape[-2:]
-        if base_mask is not None:
-             if base_mask.dim() == 4:
-                 mask_2d = base_mask[0, 0]
-             elif base_mask.dim() == 3:
-                 mask_2d = base_mask[0]
-             else:
-                 mask_2d = base_mask
-             valid_mask = (mask_2d == 0)
-        else:
-             valid_mask = torch.ones((h, w), dtype=torch.bool, device=self.device)
-
-        valid_mask &= torch.isfinite(dx) & torch.isfinite(dy)
-    
-        if not valid_mask.any():
-             return (0.0, 0.0)
-        med_dx = dx[valid_mask].median()
-        med_dy = dy[valid_mask].median()
-        
-        return (med_dx, med_dy)
-
-    def compute_optical_flow_mask(self, prev_img: torch.Tensor, curr_img: torch.Tensor, base_mask: torch.Tensor = None):
-        """
-        オプティカルフローとモーションマスクの計算 (Torch完結版)
-        """
-        # stats は呼び出し元で使われていないため、item()呼び出しを含む計算をスキップ
-        stats = {} 
-
-        if prev_img is None or curr_img is None:
-            h, w = (0, 0)
-            if prev_img is not None: h, w = prev_img.shape[-2:]
-            return torch.zeros((h, w), dtype=torch.uint8, device=self.device), (0.0, 0.0), None, stats
-
-        # Flow推論
-        flow = self.compute_flow(prev_img, curr_img)  # (H, W, 2)
-        dx = flow[..., 0]
-        dy = flow[..., 1]
-        mag = torch.sqrt(dx**2 + dy**2)
-
-        h, w = prev_img.shape[-2:]
-        
-        # マスク作成
-        if base_mask is not None:
-            if base_mask.dim() == 4:
-                mask_2d = base_mask[0, 0]
-            elif base_mask.dim() == 3:
-                mask_2d = base_mask[0]
-            else:
-                mask_2d = base_mask
-            valid_mask = (mask_2d == 0)
-        else:
-            valid_mask = torch.ones((h, w), dtype=torch.bool, device=self.device)
-
-        valid_mask &= torch.isfinite(dx) & torch.isfinite(dy)
-        
-        # item() 回避のため比率チェックは省略、またはTensorのまま比較するが
-        # ここでは後続の処理に必要なため簡略化
-        if not valid_mask.any():
-            zero_mask = torch.zeros((h, w), dtype=torch.uint8, device=self.device)
-            return zero_mask, (0.0, 0.0), flow, stats
-
-        dx_valid = dx[valid_mask]
-        dy_valid = dy[valid_mask]
-        
-        med_dx = dx_valid.median()
-        med_dy = dy_valid.median()
-
-        residual = torch.sqrt((dx - med_dx) ** 2 + (dy - med_dy) ** 2)
-        
-        residual_valid = residual[valid_mask]
-        mag_valid = mag[valid_mask]
-
-        med_res = residual_valid.median()
-        mad_res = (residual_valid - med_res).abs().median() + 1e-6
-        res_thresh = med_res + self.cfg.optflow_residual_factor * mad_res
-
-        med_mag = mag_valid.median()
-        mad_mag = (mag_valid - med_mag).abs().median() + 1e-6
-        mag_thresh = med_mag + self.cfg.optflow_magnitude_factor * mad_mag
-
-        raw_mask = ((residual > res_thresh) | (mag > mag_thresh)).detach().cpu().numpy().astype(np.uint8) * 255
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_CLOSE, kernel)
-        raw_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_OPEN, kernel)
-        motion_mask = torch.from_numpy(raw_mask).to(self.device)
-        shift = (med_dx, med_dy)
-        return motion_mask, shift, flow, stats
     
     def estimate_homography_from_features(self, prev_feats, curr_feats, min_matches: int = 4):
         """
@@ -684,29 +559,3 @@ class StitchInferencer(nn.Module):
             H_est, mask = ransac(pts_prev, pts_curr, weights=scores[0])
         H_est = H_est.squeeze(0) # (3, 3)
         return H_est
-    
-    def compute_depth_mask(self, depth_map: torch.Tensor) -> torch.Tensor:
-        """
-        depth_map: (B, 1, H, W)
-        """
-            
-        valid = torch.isfinite(depth_map)
-        if not valid.any():
-            return None
-            
-        depth_valid = depth_map[valid]
-        
-        # Percentile logic
-        # torch.quantile requires float input
-        thresh = torch.quantile(depth_map[valid], self.cfg.depth_close_percentile / 100.0)
-        
-        mask = torch.zeros_like(depth_map, dtype=torch.uint8)
-        mask[(valid) & (depth_map >= thresh)] = 255
-        
-        # Morphological Closing
-        # Kernel 5x5 ellipse
-        # Kornia closing
-        kernel = torch.ones(5, 5, device=depth_map.device) # Ellipse approx by Rect or custom kernel
-        mask_closed = kornia.morphology.closing(mask.float(), kernel)
-        
-        return (mask_closed > 0).to(torch.uint8) * 255

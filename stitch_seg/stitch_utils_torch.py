@@ -494,7 +494,7 @@ def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy,
     packed = torch.cat([img_to_warp.float(), mask_b, rm_b], dim=1)  # (1, C+2, H, W)
     warped_packed = kornia.geometry.transform.warp_perspective(
         packed,
-        H_total.unsqueeze(0),
+        (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
         dsize=(ch, cw),
         mode='nearest',
         padding_mode='zeros',
@@ -540,7 +540,7 @@ def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy,
             
         warped_grad_alpha = kornia.geometry.transform.warp_perspective(
             grad_alpha,
-            H_total.unsqueeze(0),
+            (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
             dsize=(ch, cw),
             mode='bilinear' # アルファマップは滑らかにしたいのでbilinear推奨
         )
@@ -729,7 +729,7 @@ def reset_canvas_orientation(canvas: torch.Tensor, canvas_mask: torch.Tensor, H_
 
     packed = torch.cat([canvas, canvas_mask], dim=1).float()
     warped_packed = kornia.geometry.transform.warp_perspective(
-        packed, M.unsqueeze(0), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
+        packed, (M.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
     ).to(canvas.dtype)
 
     canvas_chs = canvas.shape[1]
@@ -894,7 +894,7 @@ def paste_current_to_canvas_forward_poisson(canvas, canvas_mask, H_to_canvas, of
     packed = torch.cat([img_to_warp.float(), mask_b, rm_b], dim=1)  # (1, C+2, H, W)
     warped_packed = kornia.geometry.transform.warp_perspective(
         packed,
-        H_total.unsqueeze(0),
+        (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
         dsize=(ch, cw),
         mode='nearest',
         padding_mode='zeros',
@@ -1075,7 +1075,7 @@ def paste_current_to_canvas_forward_multiband(
     c_img = img_to_warp.shape[1]
     packed = torch.cat([img_to_warp.float(), mask_b, rm_b], dim=1)  # (1, C+2, H, W)
     warped_packed = kornia.geometry.transform.warp_perspective(
-        packed, H_total.unsqueeze(0), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
+        packed, (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
     )
     warped = warped_packed[:, :c_img].to(canvas.dtype)
     warped_mask = warped_packed[:, c_img:c_img + 1]

@@ -66,6 +66,7 @@ class StitchInferencerDev(nn.Module):
         self.roi = None
         self.ellipse_mask = None
         self.use_roi = bool(getattr(cfg, "use_static_roi", True))
+        self.roi = None
         self.apply_ellipse_mask = bool(getattr(cfg, "apply_ellipse_mask", True))
         self.equalize_hist = bool(getattr(cfg, "equalize_hist_rgb", True))
 
@@ -78,6 +79,8 @@ class StitchInferencerDev(nn.Module):
         self.extractor, self.matcher = init_feature_pipeline(cfg)
         
         self.scope_kernel = torch.ones(5, 5, device=self.device)
+        self.last_model_input = None
+        self.last_model_output = None
 
         self.reset_state()
 
@@ -89,14 +92,11 @@ class StitchInferencerDev(nn.Module):
         self.canvas4model = None
         self.canvas_mask4model = None
         self.offset_xy = (0, 0)
-        self.roi = None
         self.ellipse_mask = None
         self.prev_rgb_raw = None
         self.prev_feats = None
         self.prev_stab_transform = torch.eye(3, device=self.device)
         self.H_cum = torch.eye(3, device=self.device)
-        self.last_model_input = None
-        self.last_model_output = None
         self.last_canvas_crop = None
         self.last_canvas_bbox = None
     
@@ -238,11 +238,7 @@ class StitchInferencerDev(nn.Module):
             x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
             y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
         except Exception as e:
-            print(xs)
-            print(ys)
-            print(proj)
-            print(H, pts)
-            raise e
+            return None, None, None, None
             #return 0, 0, self.canvas.shape[-1], self.canvas.shape[-2]
         x1 = max(0, int(torch.floor(xs.min()).item()))
         y1 = max(0, int(torch.floor(ys.min()).item()))
@@ -263,6 +259,9 @@ class StitchInferencerDev(nn.Module):
             return None
             
         x1, y1, x2, y2 = self._current_canvas_bbox(frame_shape)#TODO:現在は外接、内接でも良さそう
+        if x1 is None or y1 is None or x2 is None or y2 is None:
+            self.reset_state()
+            return torch.zeros((1, self.cfg.num_classes, frame_shape[0], frame_shape[1]), dtype=torch.float32, device=self.device)
         # Crop mask check
         if self.canvas4model_mask is not None:
              # Basic check using nonzero
@@ -298,8 +297,13 @@ class StitchInferencerDev(nn.Module):
         
         # Warp back to current frame
         h, w = frame_shape
-        H_canvas_to_curr = torch.linalg.inv(self._current_to_canvas_h())
-        
+        H = self._current_to_canvas_h()
+        try:
+            H_canvas_to_curr = torch.linalg.inv(H)
+        except Exception as e:
+            print("reset canvas")
+            self.reset_state()
+            return torch.zeros((1, self.cfg.num_classes, frame_shape[0], frame_shape[1]), dtype=torch.float32, device=self.device)
         # Warp (1, Classes, H_canv, W_canv) -> (1, Classes, H, W)
         warped_pred = warp_with_transform(canvas_pred, H_canvas_to_curr, (h, w), interpolation='nearest', border_mode='zeros')
         return warped_pred.squeeze(0) # (Classes, H, W)
@@ -324,12 +328,11 @@ class StitchInferencerDev(nn.Module):
             self.prev_stab_transform = torch.eye(3, device=self.device)
             combined_mask_raw = merge_masks(tool_mask_raw, depth_mask_raw)
             self.combined_mask_prev_raw = combined_mask_raw
-            self.combined_mask_prev_stab = combined_mask_raw.clone() if combined_mask_raw is not None else None
             # Features
             tensor_lg = self._to_lightglue_gray(frame_u)
             with torch.no_grad():
                 feats = self.extractor.extract(tensor_lg)
-            self.prev_feats = filter_features_by_mask(feats, self.combined_mask_prev_stab) if self.combined_mask_prev_stab is not None else feats
+            self.prev_feats = filter_features_by_mask(feats, self.combined_mask_prev_raw) if self.combined_mask_prev_raw is not None else feats
             self.H_cum = torch.eye(3, device=self.device)
             # Paste
             if self.cfg.method == "pyramid":
@@ -393,6 +396,11 @@ class StitchInferencerDev(nn.Module):
                     # T_curr @ p_curr = H_rel @ p_prev
                     # p_prev = inv(H_rel) @ T_curr @ p_curr
                     #H_cum_curr = self.H_cum @ torch.linalg.inv(H_rel_t)
+                if isinstance(H_inv, tuple):
+                    print("first frame")
+                    self.reset_state()
+                    self.first_frame(frame_u, tool_mask_raw, depth_mask_raw)
+                    return
                 H_cum_curr = self.H_cum @ H_inv
 
             # === 8. Paste Current Frame to Canvas (update canvas) ===
