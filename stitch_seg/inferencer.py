@@ -81,6 +81,7 @@ class StitchInferencer(nn.Module):
         self.scope_kernel = torch.ones(5, 5, device=self.device)
         self.last_model_input = None
         self.last_model_output = None
+        self.last_tool_mask = None
 
         self.reset_state()
 
@@ -92,7 +93,6 @@ class StitchInferencer(nn.Module):
         self.canvas4model = None
         self.canvas_mask4model = None
         self.offset_xy = (0, 0)
-        self.ellipse_mask = None
         self.prev_rgb_raw = None
         self.prev_feats = None
         self.prev_stab_transform = torch.eye(3, device=self.device)
@@ -306,6 +306,13 @@ class StitchInferencer(nn.Module):
             return torch.zeros((1, self.cfg.num_classes, frame_shape[0], frame_shape[1]), dtype=torch.float32, device=self.device)
         # Warp (1, Classes, H_canv, W_canv) -> (1, Classes, H, W)
         warped_pred = warp_with_transform(canvas_pred, H_canvas_to_curr, (h, w), interpolation='nearest', border_mode='zeros')
+
+        if self.cfg.apply_ellipse_mask: # ellipse maskの1の部分は0にする
+            warped_pred[:, 0, self.ellipse_mask] = 1
+            warped_pred[:, 1:, (1-self.ellipse_mask)] = 0
+        if self.cfg.tool_class_ch is not None:
+            warped_pred[:, self.cfg.tool_class_ch, self.last_tool_mask.squeeze(0).squeeze(0)] = 1
+            warped_pred[:, :self.cfg.tool_class_ch, (1-self.last_tool_mask.squeeze(0).squeeze(0))] = 0
         return warped_pred.squeeze(0) # (Classes, H, W)
     
     def first_frame(self, frame_u, tool_mask_raw, depth_mask_raw):
@@ -349,7 +356,7 @@ class StitchInferencer(nn.Module):
                 )
             self.canvas = self.canvas4model.clone()
             self.canvas_mask = self.canvas4model_mask.clone()
-            
+            self.last_tool_mask = tool_mask_raw.clone()
     
     def step_canvas(self, frame_u: torch.Tensor):
         """
@@ -463,6 +470,7 @@ class StitchInferencer(nn.Module):
         self.prev_rgb_raw = frame_u.clone()
         self.combined_mask_prev_raw = combined_mask_raw if combined_mask_raw is not None else None
         self.prev_stab_transform = H_cum_curr
+        self.last_tool_mask = tool_mask_raw.clone()
 
     @torch.inference_mode()
     def inference_video(self, video_path: str):
