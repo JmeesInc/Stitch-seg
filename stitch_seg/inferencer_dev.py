@@ -221,25 +221,127 @@ class StitchInferencerDev(nn.Module):
         proj = (H @ pts.T).T
         denom = torch.clamp(proj[:, 2:3], min=1e-6)
         proj_xy = proj[:, :2] / denom
+
+        mode = getattr(self.cfg, "bbox_mode", "external")
+        # print(f"DEBUG: bbox_mode={mode}")
         
-        xs = proj_xy[:, 0]
-        ys = proj_xy[:, 1]
-        
-        try:
-            x1 = max(0, int(torch.floor(xs.min()).item()))
-            y1 = max(0, int(torch.floor(ys.min()).item()))
-            x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
-            y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
-        except Exception as e:
-            return None, None, None, None
-            #return 0, 0, self.canvas.shape[-1], self.canvas.shape[-2]
-        x1 = max(0, int(torch.floor(xs.min()).item()))
-        y1 = max(0, int(torch.floor(ys.min()).item()))
-        x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
-        y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
-        
+        if mode == "internal":
+            # 最小矩形として「現在フレーム（投影後）の外接矩形」を必ず含む
+            # その上で、canvas_mask（+ ellipse）で広げられるだけ広げる
+            xs = proj_xy[:, 0]
+            ys = proj_xy[:, 1]
+            center = proj_xy.mean(dim=0)
+            
+            try:
+                # 外接bbox（現在フレーム全体が必ず入る）
+                x1 = max(0, int(torch.floor(xs.min()).item()))
+                y1 = max(0, int(torch.floor(ys.min()).item()))
+                x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
+                y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
+                
+                # 以降は「拡張のみ」。縮小はしない（= 現在フレーム包含保証を壊さない）
+                if self.canvas4model_mask is not None:
+                    mask = self.canvas4model_mask.squeeze().clone() # (H, W) Copy to avoid modifying actual canvas mask
+                    H_mask, W_mask = mask.shape
+                    
+                    # Explicitly mask out current frame's ellipse/scope mask from the bbox calculation
+                    # (To ensure we don't include black borders even if they were somehow marked valid)
+                    if self.apply_ellipse_mask and self.ellipse_mask is not None:
+                        # self.ellipse_mask: 1=Invalid(Outside), 0=Valid(Inside)
+                        # Warp it to canvas space
+                        ch, cw = self.canvas4model.shape[-2:]
+                        warped_ellipse = warp_with_transform(
+                            self.ellipse_mask.float(), 
+                            H, 
+                            (ch, cw), 
+                            interpolation='nearest', 
+                            border_mode='zeros' # Padding with 0 (Valid) to avoid shrinking from canvas borders unnecessarily
+                        )
+                        # warped_ellipse: (1, 1, CH, CW) or (CH, CW) depending on batch
+                        if warped_ellipse.dim() == 4:
+                            warped_ellipse = warped_ellipse.squeeze(0).squeeze(0)
+                        elif warped_ellipse.dim() == 3:
+                            warped_ellipse = warped_ellipse.squeeze(0)
+                            
+                        # Apply to mask: Set regions where ellipse is 1 (Invalid) to 0
+                        mask[warped_ellipse > 0.5] = 0
+
+                    # Validate coords
+                    x1 = max(0, min(x1, W_mask))
+                    y1 = max(0, min(y1, H_mask))
+                    x2 = max(0, min(x2, W_mask))
+                    y2 = max(0, min(y2, H_mask))
+
+                    # Helper for counting consecutive True values
+                    def count_consecutive(tensor_1d, from_start=True):
+                        if not tensor_1d.any(): return 0
+                        if not from_start:
+                            tensor_1d = tensor_1d.flip(0)
+                        return tensor_1d.cumprod(dim=0).sum().item()
+
+                    # Expand only: Expand edges as long as ALL pixels are valid
+                    # (Valid is >128 to be robust to interpolation/noise)
+                    if x2 > x1 and y2 > y1:
+                        for _ in range(10): # Converges quickly
+                            changed = False
+
+                            # Left: count continuous valid columns immediately adjacent to x1
+                            if x1 > 0:
+                                roi_left = mask[y1:y2, 0:x1]
+                                valid_cols = (roi_left > 128).all(dim=0)
+                                expand = count_consecutive(valid_cols, from_start=False)
+                                if expand > 0:
+                                    x1 -= int(expand)
+                                    changed = True
+
+                            # Right
+                            if x2 < W_mask:
+                                roi_right = mask[y1:y2, x2:W_mask]
+                                valid_cols = (roi_right > 128).all(dim=0)
+                                expand = count_consecutive(valid_cols, from_start=True)
+                                if expand > 0:
+                                    x2 += int(expand)
+                                    changed = True
+
+                            # Top
+                            if y1 > 0:
+                                roi_top = mask[0:y1, x1:x2]
+                                valid_rows = (roi_top > 128).all(dim=1)
+                                expand = count_consecutive(valid_rows, from_start=False)
+                                if expand > 0:
+                                    y1 -= int(expand)
+                                    changed = True
+
+                            # Bottom
+                            if y2 < H_mask:
+                                roi_bottom = mask[y2:H_mask, x1:x2]
+                                valid_rows = (roi_bottom > 128).all(dim=1)
+                                expand = count_consecutive(valid_rows, from_start=True)
+                                if expand > 0:
+                                    y2 += int(expand)
+                                    changed = True
+
+                            if not changed:
+                                break
+
+            except Exception as e:
+                # print(f"DEBUG: Exception in internal bbox: {e}")
+                return None, None, None, None
+                #return 0, 0, self.canvas.shape[-1], self.canvas.shape[-2]
+        else:
+            xs = proj_xy[:, 0]
+            ys = proj_xy[:, 1]
+            try:
+                x1 = max(0, int(torch.floor(xs.min()).item()))
+                y1 = max(0, int(torch.floor(ys.min()).item()))
+                x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
+                y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
+            except Exception as e:
+                return None, None, None, None
+
         if x2 <= x1 or y2 <= y1:
-            return 0, 0, self.canvas4model.shape[-1], self.canvas4model .shape[-2]
+            # Fallback to full canvas if calculation fails (though rare)
+            return 0, 0, self.canvas4model.shape[-1], self.canvas4model.shape[-2]
         return x1, y1, x2, y2
     
     @torch.inference_mode()
@@ -251,21 +353,10 @@ class StitchInferencerDev(nn.Module):
         if self.model is None or source_canvas is None:
             return None
             
-        x1, y1, x2, y2 = self._current_canvas_bbox(frame_shape)#TODO:現在は外接、内接でも良さそう
+        x1, y1, x2, y2 = self._current_canvas_bbox(frame_shape)
         if x1 is None or y1 is None or x2 is None or y2 is None:
             self.reset_state()
             return torch.zeros((1, self.cfg.num_classes, frame_shape[0], frame_shape[1]), dtype=torch.float32, device=self.device)
-        # Crop mask check
-        if self.canvas4model_mask is not None:
-             # Basic check using nonzero
-             valid_indices = torch.nonzero(self.canvas4model_mask.squeeze())
-             if valid_indices.shape[0] > 0:
-                 ymin_m, xmin_m = valid_indices.min(dim=0)[0]
-                 ymax_m, xmax_m = valid_indices.max(dim=0)[0]
-                 x1 = max(0, min(x1, int(xmin_m.item())))
-                 y1 = max(0, min(y1, int(ymin_m.item())))
-                 x2 = min(self.canvas4model_mask.shape[-1], max(x2, int(xmax_m.item()) + 1))
-                 y2 = min(self.canvas4model_mask.shape[-2], max(y2, int(ymax_m.item()) + 1))
 
         crop = source_canvas[..., y1:y2, x1:x2]
         if crop.numel() == 0: return None
@@ -294,7 +385,6 @@ class StitchInferencerDev(nn.Module):
         try:
             H_canvas_to_curr = torch.linalg.inv(H)
         except Exception as e:
-            print("reset canvas")
             self.reset_state()
             return torch.zeros((1, self.cfg.num_classes, frame_shape[0], frame_shape[1]), dtype=torch.float32, device=self.device)
         # Warp (1, Classes, H_canv, W_canv) -> (1, Classes, H, W)

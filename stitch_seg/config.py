@@ -52,6 +52,7 @@ DEFAULT_CFG_VALUES = {
     "tool_label_ids": None,
     "tool_mask_dilate_px": 12,
     "depth_close_percentile": 90.0,
+    "bbox_mode": "internal", # "external" or "internal"
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 }
 

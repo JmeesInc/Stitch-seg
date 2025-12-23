@@ -24,10 +24,12 @@ import pstats
 class CFG:
     video_path = "/mnt/data/data4/shared/Cholecystostomy/Cholec80/videos/video09.mp4"
     start_frame = 0
-    end_frame = 300
+    end_frame = 1000
+    enable_depth_mask=False
     #segmentation_weights =  "checkpoint/best.pth"
     output_dir = "1217_test"
     method = "feature"
+    bbox_mode = "internal"
     apply_ellipse_mask = True
     laplacian_var_min = 60
     segmentation_weights = "/mnt/devices/dl1/in-data/data3/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
@@ -38,7 +40,7 @@ class CFG:
     debug = True
     debug_dir = "video"
     method = "dev"
-    debug_video_filename = "video09_check.mp4"
+    debug_video_filename = "video09_internal.mp4"
 
 class CanvasSegModel(nn.Module):
     def __init__(self, cfg):
