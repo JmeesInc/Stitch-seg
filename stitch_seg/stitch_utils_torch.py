@@ -429,7 +429,17 @@ def _select_features_batch0(feats: dict, keep_bool: torch.Tensor) -> dict:
     return new_feats
 
 
-def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy, current_img, tool_mask, cfg, alpha_overlap=0.80):
+def paste_current_to_canvas_forward(
+    canvas,
+    canvas_mask,
+    H_to_canvas,
+    offset_xy,
+    current_img,
+    tool_mask,
+    cfg,
+    alpha_overlap=0.80,
+    update_mode: str = "full",
+):
     """
     All inputs are Tensors (B, C, H, W) or similar.
     H_to_canvas: (3, 3)
@@ -449,6 +459,9 @@ def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy,
     """
     device = current_img.device
     scale = getattr(cfg, "canvas_superres_scale", 1.0)
+
+    canvas4model = canvas.clone()
+    canvas4model_mask = canvas_mask.clone()
     
     # Translation Matrix
     T_center = translation_matrix_from_offset(offset_xy, device=device)
@@ -512,6 +525,17 @@ def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy,
     overlap = wm_bool &cm_bool & (~wtm_bool)
     only_new = wm_bool & (~cm_bool) & (~wtm_bool) # canvasになかった領域
 
+    # Blur等で「前フレームcanvasをベースに、新規領域だけ」反映したい場合
+    # - overlap領域は一切更新しない（ブレたフレームの色を混ぜない）
+    # - maskは current footprint を入れて bbox 等に使えるようにする
+    if str(update_mode).lower() in ("only_new", "only-new", "onlynew"):
+        if only_new.any():
+            canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
+            canvas4model.masked_scatter_(only_new.expand_as(canvas4model), warped[only_new.expand_as(warped)])
+        canvas_mask[wm_bool] = 255
+        canvas4model_mask[wm_bool] = 255
+        return canvas, canvas_mask, canvas4model, canvas4model_mask
+
     # Update Canvas
     if only_new.any():
         canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
@@ -558,6 +582,7 @@ def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy,
         
         # Canvasに書き戻し
         canvas[overlap_expanded] = blended_vals.to(canvas.dtype)
+        canvas4model[overlap_expanded] = c_vals.to(canvas4model.dtype)
 
         
 
@@ -586,12 +611,13 @@ def paste_current_to_canvas_forward(canvas, canvas_mask, H_to_canvas, offset_xy,
         if h_slice > 0 and w_slice > 0:
             canvas[..., off_y:y2, off_x:x2] = hi_img[..., :h_slice, :w_slice]
             canvas_mask[..., off_y:y2, off_x:x2] = 255
-            
-        return canvas, canvas_mask
+            # initialization case: canvas4model is equal to canvas
+        return canvas, canvas_mask, canvas, canvas_mask
 
     # Update Mask
     canvas_mask[wm_bool] = 255
-    return canvas, canvas_mask
+    canvas4model_mask[wm_bool] = 255
+    return canvas, canvas_mask, canvas4model, canvas4model_mask
 
 
 def invert_canvas_valid_mask(canvas_mask: torch.Tensor) -> torch.Tensor:
@@ -832,12 +858,24 @@ def poisson_blend_roi(source, target, mask, num_iters=100):
     
     return final.clamp(0, 255) # 必要に応じて範囲制限
 
-def paste_current_to_canvas_forward_poisson(canvas, canvas_mask, H_to_canvas, offset_xy, current_img, tool_mask, cfg, alpha_overlap=0.45):
+def paste_current_to_canvas_forward_poisson(
+    canvas,
+    canvas_mask,
+    H_to_canvas,
+    offset_xy,
+    current_img,
+    tool_mask,
+    cfg,
+    alpha_overlap=0.45,
+    update_mode: str = "full",
+):
     """
     Poisson Blendingを用いた貼り付け処理
     """
     device = current_img.device
     scale = getattr(cfg, "canvas_superres_scale", 1.0)
+    canvas4model = canvas.clone()
+    canvas4model_mask = canvas_mask.clone()
     
     # --- 1. Warpの準備 ---
     T_center = translation_matrix_from_offset(offset_xy, device=device)
@@ -911,6 +949,15 @@ def paste_current_to_canvas_forward_poisson(canvas, canvas_mask, H_to_canvas, of
     overlap = wm_bool & cm_bool & (~wtm_bool)
     only_new = wm_bool & (~cm_bool) & (~wtm_bool)
 
+    if str(update_mode).lower() in ("only_new", "only-new", "onlynew"):
+        # only_new だけ更新（overlapは更新しない）
+        if only_new.any():
+            canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
+            canvas4model.masked_scatter_(only_new.expand_as(canvas4model), warped[only_new.expand_as(warped)])
+        canvas_mask[wm_bool] = 255
+        canvas4model_mask[wm_bool] = 255
+        return canvas, canvas_mask, canvas4model, canvas4model_mask
+
     # --- 3. 描画処理 (Poisson Blending) ---
 
     # Case A: 初期化 (キャンバスが空の場合など)
@@ -920,13 +967,13 @@ def paste_current_to_canvas_forward_poisson(canvas, canvas_mask, H_to_canvas, of
         if wm_bool.any():
             canvas.masked_scatter_(wm_bool.expand_as(canvas), warped[wm_bool.expand_as(warped)])
             canvas_mask[wm_bool] = 255
-        return canvas, canvas_mask
+        return canvas, canvas_mask, canvas, canvas_mask
 
     # Step 1: 新しい領域 (only_new) を先にコピー
     # これにより、overlap領域のブレンド計算時に「新しい外側の色」が境界条件として使われます
     if only_new.any():
         canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
-
+        canvas4model.masked_scatter_(only_new.expand_as(canvas4model), warped[only_new.expand_as(warped)])
     # Step 2: 重なり領域 (overlap) に対して Poisson Blending を適用
     if overlap.any():
         # ROI (Region of Interest) の計算
@@ -974,18 +1021,20 @@ def paste_current_to_canvas_forward_poisson(canvas, canvas_mask, H_to_canvas, of
                 blended_roi = blended_roi.to(canvas.dtype)
                 
                 canvas_roi = canvas[..., min_y:max_y, min_x:max_x]
+                canvas4model_roi = canvas4model[..., min_y:max_y, min_x:max_x]
                 overlap_roi = overlap[..., min_y:max_y, min_x:max_x]
                 
                 canvas_roi.masked_scatter_(overlap_roi.expand_as(canvas_roi), blended_roi.unsqueeze(0)[overlap_roi.expand_as(canvas_roi)])
-                
+                canvas4model_roi.masked_scatter_(overlap_roi.expand_as(canvas4model_roi), blended_roi.unsqueeze(0)[overlap_roi.expand_as(canvas4model_roi)])
             except Exception as e:
                 print(f"Blending Error: {e}")
                 # フォールバック：単純上書き
                 canvas.masked_scatter_(overlap.expand_as(canvas), warped[overlap.expand_as(warped)])
-
+                canvas4model.masked_scatter_(overlap.expand_as(canvas4model), warped[overlap.expand_as(warped)])
     # Update Mask
     canvas_mask[wm_bool] = 255
-    return canvas, canvas_mask
+    canvas4model_mask[wm_bool] = 255
+    return canvas, canvas_mask, canvas4model, canvas4model_mask
 # Helper (依存関係維持)
 def translation_matrix_from_offset(offset_xy, device):
     tx, ty = offset_xy[0], offset_xy[1]
@@ -1029,14 +1078,15 @@ def translation_matrix_from_offset(offset_xy, device):
 def paste_current_to_canvas_forward_multiband(
     canvas, canvas_mask, H_to_canvas, offset_xy, current_img, tool_mask, cfg, 
     levels=4, 
-    mask_erosion_iter=2,  # マスクを何ピクセル削るか（枠線・ゴミ除去用）
-    mask_blur_sigma=2.0   # マスクのぼかし強度（境界緩和用）
+    update_mode: str = "full",
 ):
     """
     Multiband Blending with Mask Softening (Erosion + Gaussian Blur).
     """
     device = current_img.device
     scale = getattr(cfg, "canvas_superres_scale", 1.0)
+    canvas4model = canvas.clone()
+    canvas4model_mask = canvas_mask.clone()
     
     # --- 1. Preparation & Warping ---
     T_center = translation_matrix_from_offset(offset_xy, device=device)
@@ -1091,15 +1141,24 @@ def paste_current_to_canvas_forward_multiband(
     overlap = valid_new_region & cm_bool
     only_new = valid_new_region & (~cm_bool)
 
+    if str(update_mode).lower() in ("only_new", "only-new", "onlynew"):
+        if only_new.any():
+            canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
+            canvas4model.masked_scatter_(only_new.expand_as(canvas4model), warped[only_new.expand_as(warped)])
+        canvas_mask[valid_new_region] = 255
+        canvas4model_mask[valid_new_region] = 255
+        return canvas, canvas_mask, canvas4model, canvas4model_mask
+
     # Initialization case
     if not cm_bool.any():
         canvas.masked_scatter_(valid_new_region.expand_as(canvas), warped[valid_new_region.expand_as(warped)])
         canvas_mask[valid_new_region] = 255
-        return canvas, canvas_mask
+        return canvas, canvas_mask, canvas, canvas_mask
 
     # Update non-overlapping area
     if only_new.any():
         canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
+        canvas4model.masked_scatter_(only_new.expand_as(canvas4model), warped[only_new.expand_as(warped)])
     
     # --- 2. Multiband Blending Logic with Mask Smoothing ---
     if overlap.any():
@@ -1172,11 +1231,12 @@ def paste_current_to_canvas_forward_multiband(
             
             blended_result = canvas_crop * (1.0 - update_weight) + roi_blended.to(canvas.dtype) * update_weight
             canvas[..., y_min:y_max, x_min:x_max] = blended_result
+            canvas4model[..., y_min:y_max, x_min:x_max] = roi_blended.to(canvas4model.dtype)
 
     # Update Mask
     canvas_mask[valid_new_region] = 255
-    
-    return canvas, canvas_mask
+    canvas4model_mask[valid_new_region] = 255
+    return canvas, canvas_mask, canvas4model, canvas4model_mask
 
 def fast_gradient_mask(mask: torch.Tensor, radius: int, scale_factor: float = 0.125) -> torch.Tensor:
     """

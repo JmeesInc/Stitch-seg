@@ -22,25 +22,26 @@ import pstats
 
 
 class CFG:
-    video_path = "/mnt/data/data4/shared/Cholecystostomy/Cholec80/videos/video09.mp4"
-    start_frame = 0
-    end_frame = 1000
-    enable_depth_mask=False
-    #segmentation_weights =  "checkpoint/best.pth"
+    video_path = "/mnt/data/data11/share/TLH/standardized_videos/001510725.mp4"
+    start_frame = 122000
+    end_frame = 122300
+    enable_depth_mask = False
     output_dir = "1217_test"
-    method = "feature"
+    method = "pyramid"
     bbox_mode = "internal"
-    apply_ellipse_mask = True
+    apply_ellipse_mask = False
     laplacian_var_min = 60
     segmentation_weights = "/mnt/devices/dl1/in-data/data3/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
-    num_classes = 3
+    num_classes = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tool_class_ch = 0
+    # NOTE:
+    # `StitchInferencer.model_inference()` can optionally inject tool mask into a class channel.
+    # For binary segmentation (num_classes=1), set this to None to avoid overwriting the only channel.
+    tool_class_ch = None
 
     debug = True
-    debug_dir = "video"
-    method = "dev"
-    debug_video_filename = "video09_internal.mp4"
+    debug_dir = "1224_test"
+    debug_video_filename = "internal.mp4"
 
 class CanvasSegModel(nn.Module):
     def __init__(self, cfg):
@@ -59,12 +60,13 @@ class CanvasSegModel(nn.Module):
 
         # 重みのロード
         state = torch.load(cfg.segmentation_weights, map_location=cfg.device)
-        #self.model.load_state_dict(state, strict=True)
+        self.model.load_state_dict(state, strict=True)
         self.model.eval()
         
         self.device = cfg.device
         self.input_size = getattr(cfg, "segm_input_size", 512)
         self.last_model_input_image = None
+        self.last_model_output = None
 
     def _prepare_input(self, img_tensor: torch.Tensor):
         img_tensor = img_tensor.float() / 255.0
@@ -85,6 +87,7 @@ class CanvasSegModel(nn.Module):
         self.last_model_input_image = input_tensor
         target_hw = canvas_bgr.shape[-2:]
         output = self._predict_to_shape(input_tensor, target_hw)
+        self.last_model_output = output
             
         return output
 
@@ -319,9 +322,9 @@ def main():
                         canvas_vis = cv2.resize(canvas_vis, (frame_vis.shape[1], frame_vis.shape[0]), interpolation=cv2.INTER_LINEAR)
                     model_input = inferencer.last_model_input if inferencer.last_model_input is not None else seg_model.last_model_input_image
                     model_output = inferencer.last_model_output if inferencer.last_model_output is not None else seg_model.last_model_output
+                    # model_output is a probability/logit-like map; don't convert it to an 8-bit image
+                    # before thresholding in overlay_mask().
                     model_input = to_numpy_image(model_input)
-                    model_output = to_numpy_image(model_output)
-                    
                     model_input = overlay_mask(model_input, model_output)
                     # Build a 3x2 grid for visual sanity checks.
                     panel = build_debug_panel(

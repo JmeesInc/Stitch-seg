@@ -154,8 +154,6 @@ class StitchInferencerDev(nn.Module):
         if self.apply_ellipse_mask:
             if self.ellipse_mask is None:
                 self.extract_scope_mask(torch_frame)
-                cv2.imwrite("ellipse_mask.png", self.ellipse_mask.squeeze(0).squeeze(0).cpu().detach().numpy()*255.0)
-                cv2.imwrite("torch_frame.png", torch_frame.squeeze(0).permute(1, 2, 0).cpu().detach().numpy().astype(np.uint8))
 
         return torch_frame
 
@@ -234,10 +232,11 @@ class StitchInferencerDev(nn.Module):
             
             try:
                 # 外接bbox（現在フレーム全体が必ず入る）
-                x1 = max(0, int(torch.floor(xs.min()).item()))
-                y1 = max(0, int(torch.floor(ys.min()).item()))
-                x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
-                y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
+                base_x1 = max(0, int(torch.floor(xs.min()).item()))
+                base_y1 = max(0, int(torch.floor(ys.min()).item()))
+                base_x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
+                base_y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
+                x1, y1, x2, y2 = base_x1, base_y1, base_x2, base_y2
                 
                 # 以降は「拡張のみ」。縮小はしない（= 現在フレーム包含保証を壊さない）
                 if self.canvas4model_mask is not None:
@@ -324,6 +323,62 @@ class StitchInferencerDev(nn.Module):
                             if not changed:
                                 break
 
+                    # Aspect ratio constraint:
+                    # Keep bbox aspect reasonably close to current frame aspect, but NEVER smaller than base bbox.
+                    # Define distortion as max(bbox_ar/frame_ar, frame_ar/bbox_ar) and clamp to <= 1.33.
+                    max_aspect_distortion = float(getattr(self.cfg, "bbox_aspect_max_distortion", 1.33))
+                    if max_aspect_distortion < 1.0:
+                        max_aspect_distortion = 1.0
+
+                    if x2 > x1 and y2 > y1:
+                        frame_ar = float(w) / float(h) if h > 0 else 1.0
+                        bbox_w = float(x2 - x1)
+                        bbox_h = float(y2 - y1)
+                        bbox_ar = bbox_w / bbox_h if bbox_h > 0 else frame_ar
+
+                        lower_ar = frame_ar / max_aspect_distortion
+                        upper_ar = frame_ar * max_aspect_distortion
+
+                        # Helper to clamp interval while keeping base bbox inside expanded bbox
+                        def _shrink_width_keep_base(desired_w: float):
+                            nonlocal x1, x2
+                            desired_w_i = int(max(1, round(desired_w)))
+                            base_w_i = int(max(1, base_x2 - base_x1))
+                            desired_w_i = max(desired_w_i, base_w_i)
+                            # Feasible x1 range
+                            lo = max(x1, base_x2 - desired_w_i)
+                            hi = min(x2 - desired_w_i, base_x1)
+                            if lo > hi:
+                                return False
+                            new_x1 = min(max(x1, lo), hi)
+                            x1 = int(new_x1)
+                            x2 = int(new_x1 + desired_w_i)
+                            return True
+
+                        def _shrink_height_keep_base(desired_h: float):
+                            nonlocal y1, y2
+                            desired_h_i = int(max(1, round(desired_h)))
+                            base_h_i = int(max(1, base_y2 - base_y1))
+                            desired_h_i = max(desired_h_i, base_h_i)
+                            lo = max(y1, base_y2 - desired_h_i)
+                            hi = min(y2 - desired_h_i, base_y1)
+                            if lo > hi:
+                                return False
+                            new_y1 = min(max(y1, lo), hi)
+                            y1 = int(new_y1)
+                            y2 = int(new_y1 + desired_h_i)
+                            return True
+
+                        # If too wide, shrink width; if too tall, shrink height.
+                        if bbox_ar > upper_ar:
+                            # Need w/h <= upper_ar  => w <= upper_ar * h
+                            target_w = upper_ar * bbox_h
+                            _shrink_width_keep_base(target_w)
+                        elif bbox_ar < lower_ar:
+                            # Need w/h >= lower_ar => h <= w / lower_ar
+                            target_h = bbox_w / lower_ar if lower_ar > 1e-8 else bbox_h
+                            _shrink_height_keep_base(target_h)
+
             except Exception as e:
                 # print(f"DEBUG: Exception in internal bbox: {e}")
                 return None, None, None, None
@@ -392,8 +447,12 @@ class StitchInferencerDev(nn.Module):
 
         if self.cfg.apply_ellipse_mask: # ellipse maskの1の部分は0にする
             warped_pred[:, 0, :, :] = self.ellipse_mask.squeeze(0).float()*255.0
-        if self.cfg.tool_class_ch is not None:
-            warped_pred[:, self.cfg.tool_class_ch, :, :] = self.last_tool_mask.squeeze(0).float()*255.0
+        # Optionally inject tool mask into a dedicated class channel.
+        # IMPORTANT: For binary segmentation (num_classes=1), injecting would overwrite the only channel
+        # and make downstream visualizations look like "tool segmentation".
+        if self.cfg.tool_class_ch is not None and getattr(self.cfg, "num_classes", 0) > 1:
+            if self.last_tool_mask is not None and 0 <= int(self.cfg.tool_class_ch) < warped_pred.shape[1]:
+                warped_pred[:, int(self.cfg.tool_class_ch), :, :] = self.last_tool_mask.squeeze(0).float()
         return warped_pred.squeeze(0) # (Classes, H, W)
     
     def first_frame(self, frame_u, tool_mask_raw, depth_mask_raw):
@@ -424,19 +483,17 @@ class StitchInferencerDev(nn.Module):
             self.H_cum = torch.eye(3, device=self.device)
             # Paste
             if self.cfg.method == "pyramid":
-                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_multiband(
+                self.canvas, self.canvas_mask, self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_multiband(
                     self.canvas, self.canvas_mask, self.H_cum, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
                 )
             elif self.cfg.method == "poisson":
-                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_poisson(
+                self.canvas, self.canvas_mask, self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_poisson(
                     self.canvas, self.canvas_mask, self.H_cum, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
                 )
             else:
-                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward(
+                self.canvas, self.canvas_mask, self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward(
                     self.canvas, self.canvas_mask, self.H_cum, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
                 )
-            self.canvas = self.canvas4model.clone()
-            self.canvas_mask = self.canvas4model_mask.clone()
             self.last_tool_mask = tool_mask_raw.clone()
     
     def step_canvas(self, frame_u: torch.Tensor):
@@ -491,20 +548,56 @@ class StitchInferencerDev(nn.Module):
                 H_cum_curr = self.H_cum @ H_inv
 
             # === 8. Paste Current Frame to Canvas (update canvas) ===
-            # self.canvas4modelはblurでも更新、次回は使わない
-            #　self.canvasはblurなしでは更新しない、次回は使う
+            # self.canvas4model/self.canvas4model_mask: current frame inference用なので、blurでも更新してよい
+            # self.canvas/self.canvas_mask: 次フレームの推論に使うので、blur時は更新しない
+            blur = laplacian_var(frame_u.float()) < self.cfg.laplacian_var_min
+
+            # NOTE:
+            # paste_current_to_canvas_forward*() は引数 canvas/canvas_mask をインプレース更新するため、
+            # blur時に self.canvas をそのまま渡すと「代入しなくても」self.canvasが更新されてしまう。
+            # blur時は clone を渡して current-frame 用 (canvas4model) だけ更新する。
+            canvas_in = self.canvas if not blur else self.canvas.clone()
+            canvas_mask_in = self.canvas_mask if not blur else self.canvas_mask.clone()
+            update_mode = "only_new" if blur else "full"
             if self.cfg.method == "pyramid":
-                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_multiband(
-                    self.canvas, self.canvas_mask, H_cum_curr, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
+                new_canvas, new_canvas_mask, self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_multiband(
+                    canvas_in,
+                    canvas_mask_in,
+                    H_cum_curr,
+                    self.offset_xy,
+                    frame_u,
+                    combined_mask_raw,
+                    self.cfg,
+                    self.cfg.alpha_overlap,
+                    update_mode=update_mode,
                 )
             elif self.cfg.method == "poisson":
-                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_poisson(
-                    self.canvas, self.canvas_mask, H_cum_curr, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
+                new_canvas, new_canvas_mask, self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_poisson(
+                    canvas_in,
+                    canvas_mask_in,
+                    H_cum_curr,
+                    self.offset_xy,
+                    frame_u,
+                    combined_mask_raw,
+                    self.cfg,
+                    self.cfg.alpha_overlap,
+                    update_mode=update_mode,
                 )
             else:
-                self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward(
-                    self.canvas, self.canvas_mask, H_cum_curr, self.offset_xy, frame_u, combined_mask_raw, self.cfg, self.cfg.alpha_overlap
+                new_canvas, new_canvas_mask, self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward(
+                    canvas_in,
+                    canvas_mask_in,
+                    H_cum_curr,
+                    self.offset_xy,
+                    frame_u,
+                    combined_mask_raw,
+                    self.cfg,
+                    self.cfg.alpha_overlap,
+                    update_mode=update_mode,
                 )
+                # 次フレーム用のbase canvasは、blur時は更新しない
+            if not blur:
+                self.canvas, self.canvas_mask = new_canvas, new_canvas_mask
             
             # Transform current features to raw space for next iteration
             self.prev_feats = curr_feats
@@ -534,17 +627,15 @@ class StitchInferencerDev(nn.Module):
                  rot > getattr(self.cfg, "reset_rotate_angle", 15.0) or
                  scale > getattr(self.cfg, "reset_scale_factor", 2.0))
 
-        blur = laplacian_var(frame_u.float()) < self.cfg.laplacian_var_min
-        
         if not blur:
             if reset:
                 H_cum_curr = H_cum_curr.to(torch.float32)
-                self.canvas4model, self.canvas4model_mask, self.offset_xy = reset_canvas_orientation(
-                    self.canvas4model, self.canvas4model_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, self.offset_xy
+                self.canvas, self.canvas_mask, self.offset_xy = reset_canvas_orientation(
+                    self.canvas, self.canvas_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, self.offset_xy
                 )
                 self.H_cum = torch.eye(3, device=self.device)
-            self.canvas = self.canvas4model.clone()
-            self.canvas_mask = self.canvas4model_mask.clone()
+            #self.canvas = self.canvas4model.clone()
+            #self.canvas_mask = self.canvas4model_mask.clone()
             #print(laplacian_var(frame_u.float()), self.cfg.laplacian_var_min, "canvas update")
         
         # === 13. Update State ===

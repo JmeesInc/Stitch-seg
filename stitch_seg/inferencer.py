@@ -427,8 +427,12 @@ class StitchInferencer(nn.Module):
 
         if self.cfg.apply_ellipse_mask: # ellipse maskの1の部分は0にする
             warped_pred[:, 0, :, :] = self.ellipse_mask.squeeze(0).float()*255.0
-        if self.cfg.tool_class_ch is not None:
-            warped_pred[:, self.cfg.tool_class_ch, :, :] = self.last_tool_mask.squeeze(0).float()*255.0
+        # Optionally inject tool mask into a dedicated class channel.
+        # IMPORTANT: For binary segmentation (num_classes=1), injecting would overwrite the only channel
+        # and make downstream visualizations look like "tool segmentation".
+        if self.cfg.tool_class_ch is not None and getattr(self.cfg, "num_classes", 0) > 1:
+            if self.last_tool_mask is not None and 0 <= int(self.cfg.tool_class_ch) < warped_pred.shape[1]:
+                warped_pred[:, int(self.cfg.tool_class_ch), :, :] = self.last_tool_mask.squeeze(0).float()
         return warped_pred.squeeze(0) # (Classes, H, W)
     
     def first_frame(self, frame_u, tool_mask_raw, depth_mask_raw):
