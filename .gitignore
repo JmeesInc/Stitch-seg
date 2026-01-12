@@ -2,6 +2,7 @@
 __pycache__/
 *.py[oc]
 *.pth
+*.pt
 build/
 dist/
 wheels/

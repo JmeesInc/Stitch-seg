@@ -14,6 +14,7 @@ from ptlflow.utils.io_adapter import IOAdapter
 
 from .models import (
     load_masking_model,
+    load_masking_model2,
     load_depth_model,
     init_feature_pipeline,
 )
@@ -71,6 +72,7 @@ class StitchInferencerDev(nn.Module):
         self.equalize_hist = bool(getattr(cfg, "equalize_hist_rgb", True))
 
         self.masking_model = load_masking_model(cfg)
+        self.masking_model2 = load_masking_model2(cfg)
         self.seg_processor = nn.Sequential(
             K.Resize(size=(512, 512)),
             K.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
@@ -178,12 +180,16 @@ class StitchInferencerDev(nn.Module):
         depth_tensor = None
         with torch.autocast(dtype=torch.float16, device_type=self.device.type, enabled=True):
             masking = self.masking_model(input_img)
+            masking2 = self.masking_model2(input_img)
             if self.depth_model is not None:
                 depth_feature = self.depth_model.forward_features(input_img_dpt)
                 depth_tensor = self.depth_model.forward_depth(depth_feature, input_img_dpt.shape)[0]
         
         masking = torch.nn.functional.interpolate(masking, size=frame_u.shape[-2:], mode='bilinear', align_corners=False)
+        masking2 = torch.nn.functional.interpolate(masking2, size=frame_u.shape[-2:], mode='bilinear', align_corners=False)
         masking = (masking > 0.5).to(torch.uint8) * 255
+        masking2 = (masking2 > 0.5).to(torch.uint8) * 255
+        masking = masking | masking2
         
         if depth_tensor is not None:
             depth_tensor = torch.nn.functional.interpolate(depth_tensor, size=frame_u.shape[-2:], mode='bilinear', align_corners=False)

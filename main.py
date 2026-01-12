@@ -1,7 +1,7 @@
 """Run segmentation on a stitched canvas using StitchInferencer."""
 import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from typing import Optional
 
 import albumentations as A
@@ -22,7 +22,7 @@ import pstats
 
 
 class CFG:
-    video_path = "/mnt/data/data11/share/TLH/standardized_videos/001510725.mp4"
+    video_path = "/mnt/devices/dl2/ex-data-2/data11/share/TLH/standardized_videos/001510725.mp4"
     start_frame = 122000
     end_frame = 122300
     enable_depth_mask = False
@@ -31,7 +31,7 @@ class CFG:
     bbox_mode = "internal"
     apply_ellipse_mask = False
     laplacian_var_min = 60
-    segmentation_weights = "/mnt/devices/dl1/in-data/data3/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
+    segmentation_weights = "/mnt/devices/dl1/in-data/data4/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
     num_classes = 1
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # NOTE:
