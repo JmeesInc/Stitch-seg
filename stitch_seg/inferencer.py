@@ -170,7 +170,7 @@ class StitchInferencer(nn.Module):
         radius -= self.cfg.canvas_border_trim_px
         mask = cv2.circle(mask, (int(x), int(y)), int(radius), 1, -1)
         mask = np.ones_like(mask) - mask
-        self.ellipse_mask = torch.from_numpy(mask).to(self.device).unsqueeze(0).unsqueeze(0).to(torch.float32)
+        self.ellipse_mask = torch.from_numpy(mask).to(self.device).unsqueeze(0).unsqueeze(0)
 
 
 
@@ -240,7 +240,7 @@ class StitchInferencer(nn.Module):
             depth_mask = None
         
         if self.apply_ellipse_mask:
-            masking = masking | torch.nn.functional.interpolate(self.ellipse_mask, size=frame_u.shape[-2:], mode='nearest')
+            masking = masking | torch.nn.functional.interpolate(self.ellipse_mask.float(), size=frame_u.shape[-2:], mode='nearest').long()
         
         return masking, depth_mask
 
