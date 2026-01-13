@@ -492,8 +492,19 @@ class StitchInferencer(nn.Module):
         # Warp (1, Classes, H_canv, W_canv) -> (1, Classes, H, W)
         warped_pred = warp_with_transform(canvas_pred, H_canvas_to_curr, (h, w), interpolation='nearest', border_mode='zeros')
 
-        if self.cfg.apply_ellipse_mask: # ellipse maskの1の部分は0にする
-            warped_pred[:, 0, :, :] = self.ellipse_mask.squeeze(0).float()*255.0
+        if self.cfg.apply_ellipse_mask:  # ellipse maskの1の部分は0にする
+            # NOTE: `self.ellipse_mask` can be computed on a different resolution
+            # (e.g., before ROI crop or when input sizes change). Always resize to
+            # the current output shape to avoid shape mismatch crashes.
+            if self.ellipse_mask is not None:
+                ellipse = self.ellipse_mask
+                if ellipse.dim() == 3:
+                    ellipse = ellipse.unsqueeze(0)  # (1,1,H,W) expected
+                if ellipse.shape[-2:] != (h, w):
+                    ellipse = torch.nn.functional.interpolate(
+                        ellipse.float(), size=(h, w), mode="nearest"
+                    )
+                warped_pred[:, 0, :, :] = ellipse.squeeze(0).float() * 255.0
         # Optionally inject tool mask into a dedicated class channel.
         # IMPORTANT: For binary segmentation (num_classes=1), injecting would overwrite the only channel
         # and make downstream visualizations look like "tool segmentation".
