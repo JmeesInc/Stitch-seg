@@ -170,7 +170,7 @@ class StitchInferencer(nn.Module):
         radius -= self.cfg.canvas_border_trim_px
         mask = cv2.circle(mask, (int(x), int(y)), int(radius), 1, -1)
         mask = np.ones_like(mask) - mask
-        self.ellipse_mask = torch.from_numpy(mask).to(self.device).unsqueeze(0).unsqueeze(0).to(torch.long)
+        self.ellipse_mask = torch.from_numpy(mask).to(self.device).unsqueeze(0).unsqueeze(0).to(torch.float32)
 
 
 
