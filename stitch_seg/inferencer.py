@@ -146,7 +146,10 @@ class StitchInferencer(nn.Module):
         画像から内視鏡の円/楕円領域のパラメータを推定する
         Return: mask (x, y) - 1が内視鏡視野
         """
-        gray = cv2.cvtColor(torch_frame[0].permute(1, 2, 0).cpu().numpy().astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        if torch_frame.isinstance(torch.Tensor):
+            gray = cv2.cvtColor(torch_frame[0].permute(1, 2, 0).cpu().numpy().astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        else:
+            gray = cv2.cvtColor(torch_frame, cv2.COLOR_BGR2GRAY)
         mask = np.zeros_like(gray)
         
         # 1. 二値化 (閾値は環境に合わせて調整。10-30あたりが一般的)
