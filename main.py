@@ -24,7 +24,7 @@ import pstats
 class CFG:
     video_path = "/mnt/devices/dl2/ex-data-2/data11/share/TLH/standardized_videos/001510725.mp4"
     start_frame = 122000
-    end_frame = 122300
+    end_frame = 123000
     enable_depth_mask = False
     output_dir = "1217_test"
     method = "pyramid"

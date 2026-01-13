@@ -688,9 +688,18 @@ class StitchInferencer(nn.Module):
         if not blur:
             if reset:
                 H_cum_curr = H_cum_curr.to(torch.float32)
-                self.canvas, self.canvas_mask, self.offset_xy = reset_canvas_orientation(
-                    self.canvas, self.canvas_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, self.offset_xy
+                old_offset_xy = self.offset_xy
+                self.canvas, self.canvas_mask, new_offset_xy = reset_canvas_orientation(
+                    self.canvas, self.canvas_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, old_offset_xy
                 )
+                # Keep `canvas4model` in the SAME coordinate system after reset.
+                # Otherwise, `model_inference()` (which reads `canvas4model`) will be misaligned
+                # with `offset_xy`/`H_cum` (which are reset here).
+                if self.canvas4model is not None and self.canvas4model_mask is not None:
+                    self.canvas4model, self.canvas4model_mask, _ = reset_canvas_orientation(
+                        self.canvas4model, self.canvas4model_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, old_offset_xy
+                    )
+                self.offset_xy = new_offset_xy
                 self.H_cum = torch.eye(3, device=self.device)
             #self.canvas = self.canvas4model.clone()
             #self.canvas_mask = self.canvas4model_mask.clone()
