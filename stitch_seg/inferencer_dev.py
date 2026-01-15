@@ -107,7 +107,10 @@ class StitchInferencerDev(nn.Module):
         画像から内視鏡の円/楕円領域のパラメータを推定する
         Return: mask (x, y) - 1が内視鏡視野
         """
-        gray = cv2.cvtColor(torch_frame[0].permute(1, 2, 0).cpu().numpy().astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        if isinstance(torch_frame, torch.Tensor):
+            gray = cv2.cvtColor(torch_frame[0].permute(1, 2, 0).cpu().numpy().astype(np.uint8), cv2.COLOR_BGR2GRAY)
+        else:
+            gray = cv2.cvtColor(torch_frame, cv2.COLOR_BGR2GRAY)
         mask = np.zeros_like(gray)
         
         # 1. 二値化 (閾値は環境に合わせて調整。10-30あたりが一般的)
@@ -128,7 +131,7 @@ class StitchInferencerDev(nn.Module):
         radius -= self.cfg.canvas_border_trim_px
         mask = cv2.circle(mask, (int(x), int(y)), int(radius), 1, -1)
         mask = np.ones_like(mask) - mask
-        self.ellipse_mask = torch.from_numpy(mask).to(self.device).unsqueeze(0).unsqueeze(0).to(torch.long)
+        self.ellipse_mask = torch.from_numpy(mask).to(self.device).unsqueeze(0).unsqueeze(0)
 
 
 
@@ -198,7 +201,7 @@ class StitchInferencerDev(nn.Module):
             depth_mask = None
         
         if self.apply_ellipse_mask:
-            masking = masking | torch.nn.functional.interpolate(self.ellipse_mask, size=frame_u.shape[-2:], mode='nearest')
+            masking = masking | torch.nn.functional.interpolate(self.ellipse_mask.float(), size=frame_u.shape[-2:], mode='nearest').long()
         
         return masking, depth_mask
 
@@ -228,178 +231,97 @@ class StitchInferencerDev(nn.Module):
 
         mode = getattr(self.cfg, "bbox_mode", "external")
         # print(f"DEBUG: bbox_mode={mode}")
-        
-        if mode == "internal":
-            # 最小矩形として「現在フレーム（投影後）の外接矩形」を必ず含む
-            # その上で、canvas_mask（+ ellipse）で広げられるだけ広げる
+
+        def _original_bbox():
             xs = proj_xy[:, 0]
             ys = proj_xy[:, 1]
-            center = proj_xy.mean(dim=0)
-            
             try:
-                # 外接bbox（現在フレーム全体が必ず入る）
-                base_x1 = max(0, int(torch.floor(xs.min()).item()))
-                base_y1 = max(0, int(torch.floor(ys.min()).item()))
-                base_x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
-                base_y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
-                x1, y1, x2, y2 = base_x1, base_y1, base_x2, base_y2
-                
-                # 以降は「拡張のみ」。縮小はしない（= 現在フレーム包含保証を壊さない）
-                if self.canvas4model_mask is not None:
-                    mask = self.canvas4model_mask.squeeze().clone() # (H, W) Copy to avoid modifying actual canvas mask
-                    H_mask, W_mask = mask.shape
-                    
-                    # Explicitly mask out current frame's ellipse/scope mask from the bbox calculation
-                    # (To ensure we don't include black borders even if they were somehow marked valid)
-                    if self.apply_ellipse_mask and self.ellipse_mask is not None:
-                        # self.ellipse_mask: 1=Invalid(Outside), 0=Valid(Inside)
-                        # Warp it to canvas space
-                        ch, cw = self.canvas4model.shape[-2:]
-                        warped_ellipse = warp_with_transform(
-                            self.ellipse_mask.float(), 
-                            H, 
-                            (ch, cw), 
-                            interpolation='nearest', 
-                            border_mode='zeros' # Padding with 0 (Valid) to avoid shrinking from canvas borders unnecessarily
-                        )
-                        # warped_ellipse: (1, 1, CH, CW) or (CH, CW) depending on batch
-                        if warped_ellipse.dim() == 4:
-                            warped_ellipse = warped_ellipse.squeeze(0).squeeze(0)
-                        elif warped_ellipse.dim() == 3:
-                            warped_ellipse = warped_ellipse.squeeze(0)
-                            
-                        # Apply to mask: Set regions where ellipse is 1 (Invalid) to 0
-                        mask[warped_ellipse > 0.5] = 0
+                ox1 = max(0, int(torch.floor(xs.min()).item()))
+                oy1 = max(0, int(torch.floor(ys.min()).item()))
+                ox2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
+                oy2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
+            except Exception:
+                return None, None, None, None
+            return ox1, oy1, ox2, oy2
 
-                    # Validate coords
-                    x1 = max(0, min(x1, W_mask))
-                    y1 = max(0, min(y1, H_mask))
-                    x2 = max(0, min(x2, W_mask))
-                    y2 = max(0, min(y2, H_mask))
+        if mode == "internal":
+            x1, y1, x2, y2 = _original_bbox()
+            if x1 is None or y1 is None or x2 is None or y2 is None:
+                return None, None, None, None
+            if self.canvas4model_mask is not None:
+                mask = self.canvas4model_mask.squeeze().clone()
+                H_mask, W_mask = mask.shape
+                x1 = max(0, min(x1, W_mask))
+                y1 = max(0, min(y1, H_mask))
+                x2 = max(0, min(x2, W_mask))
+                y2 = max(0, min(y2, H_mask))
 
-                    # Helper for counting consecutive True values
+                # Only expand if the original bbox is fully inside the valid mask.
+                if x2 > x1 and y2 > y1 and (mask[y1:y2, x1:x2] > 0).all():
                     def count_consecutive(tensor_1d, from_start=True):
-                        if not tensor_1d.any(): return 0
+                        if not tensor_1d.any():
+                            return 0
                         if not from_start:
                             tensor_1d = tensor_1d.flip(0)
                         return tensor_1d.cumprod(dim=0).sum().item()
 
-                    # Expand only: Expand edges as long as ALL pixels are valid
-                    # (Valid is >128 to be robust to interpolation/noise)
-                    if x2 > x1 and y2 > y1:
-                        for _ in range(10): # Converges quickly
-                            changed = False
+                    for _ in range(10):
+                        changed = False
 
-                            # Left: count continuous valid columns immediately adjacent to x1
-                            if x1 > 0:
-                                roi_left = mask[y1:y2, 0:x1]
-                                valid_cols = (roi_left > 128).all(dim=0)
-                                expand = count_consecutive(valid_cols, from_start=False)
-                                if expand > 0:
-                                    x1 -= int(expand)
-                                    changed = True
+                        if x1 > 0:
+                            roi_left = mask[y1:y2, 0:x1]
+                            valid_cols = (roi_left > 0).all(dim=0)
+                            expand = count_consecutive(valid_cols, from_start=False)
+                            if expand > 0:
+                                x1 -= int(expand)
+                                changed = True
 
-                            # Right
-                            if x2 < W_mask:
-                                roi_right = mask[y1:y2, x2:W_mask]
-                                valid_cols = (roi_right > 128).all(dim=0)
-                                expand = count_consecutive(valid_cols, from_start=True)
-                                if expand > 0:
-                                    x2 += int(expand)
-                                    changed = True
+                        if x2 < W_mask:
+                            roi_right = mask[y1:y2, x2:W_mask]
+                            valid_cols = (roi_right > 0).all(dim=0)
+                            expand = count_consecutive(valid_cols, from_start=True)
+                            if expand > 0:
+                                x2 += int(expand)
+                                changed = True
 
-                            # Top
-                            if y1 > 0:
-                                roi_top = mask[0:y1, x1:x2]
-                                valid_rows = (roi_top > 128).all(dim=1)
-                                expand = count_consecutive(valid_rows, from_start=False)
-                                if expand > 0:
-                                    y1 -= int(expand)
-                                    changed = True
+                        if y1 > 0:
+                            roi_top = mask[0:y1, x1:x2]
+                            valid_rows = (roi_top > 0).all(dim=1)
+                            expand = count_consecutive(valid_rows, from_start=False)
+                            if expand > 0:
+                                y1 -= int(expand)
+                                changed = True
 
-                            # Bottom
-                            if y2 < H_mask:
-                                roi_bottom = mask[y2:H_mask, x1:x2]
-                                valid_rows = (roi_bottom > 128).all(dim=1)
-                                expand = count_consecutive(valid_rows, from_start=True)
-                                if expand > 0:
-                                    y2 += int(expand)
-                                    changed = True
+                        if y2 < H_mask:
+                            roi_bottom = mask[y2:H_mask, x1:x2]
+                            valid_rows = (roi_bottom > 0).all(dim=1)
+                            expand = count_consecutive(valid_rows, from_start=True)
+                            if expand > 0:
+                                y2 += int(expand)
+                                changed = True
 
-                            if not changed:
-                                break
-
-                    # Aspect ratio constraint:
-                    # Keep bbox aspect reasonably close to current frame aspect, but NEVER smaller than base bbox.
-                    # Define distortion as max(bbox_ar/frame_ar, frame_ar/bbox_ar) and clamp to <= 1.33.
-                    max_aspect_distortion = float(getattr(self.cfg, "bbox_aspect_max_distortion", 1.33))
-                    if max_aspect_distortion < 1.0:
-                        max_aspect_distortion = 1.0
-
-                    if x2 > x1 and y2 > y1:
-                        frame_ar = float(w) / float(h) if h > 0 else 1.0
-                        bbox_w = float(x2 - x1)
-                        bbox_h = float(y2 - y1)
-                        bbox_ar = bbox_w / bbox_h if bbox_h > 0 else frame_ar
-
-                        lower_ar = frame_ar / max_aspect_distortion
-                        upper_ar = frame_ar * max_aspect_distortion
-
-                        # Helper to clamp interval while keeping base bbox inside expanded bbox
-                        def _shrink_width_keep_base(desired_w: float):
-                            nonlocal x1, x2
-                            desired_w_i = int(max(1, round(desired_w)))
-                            base_w_i = int(max(1, base_x2 - base_x1))
-                            desired_w_i = max(desired_w_i, base_w_i)
-                            # Feasible x1 range
-                            lo = max(x1, base_x2 - desired_w_i)
-                            hi = min(x2 - desired_w_i, base_x1)
-                            if lo > hi:
-                                return False
-                            new_x1 = min(max(x1, lo), hi)
-                            x1 = int(new_x1)
-                            x2 = int(new_x1 + desired_w_i)
-                            return True
-
-                        def _shrink_height_keep_base(desired_h: float):
-                            nonlocal y1, y2
-                            desired_h_i = int(max(1, round(desired_h)))
-                            base_h_i = int(max(1, base_y2 - base_y1))
-                            desired_h_i = max(desired_h_i, base_h_i)
-                            lo = max(y1, base_y2 - desired_h_i)
-                            hi = min(y2 - desired_h_i, base_y1)
-                            if lo > hi:
-                                return False
-                            new_y1 = min(max(y1, lo), hi)
-                            y1 = int(new_y1)
-                            y2 = int(new_y1 + desired_h_i)
-                            return True
-
-                        # If too wide, shrink width; if too tall, shrink height.
-                        if bbox_ar > upper_ar:
-                            # Need w/h <= upper_ar  => w <= upper_ar * h
-                            target_w = upper_ar * bbox_h
-                            _shrink_width_keep_base(target_w)
-                        elif bbox_ar < lower_ar:
-                            # Need w/h >= lower_ar => h <= w / lower_ar
-                            target_h = bbox_w / lower_ar if lower_ar > 1e-8 else bbox_h
-                            _shrink_height_keep_base(target_h)
-
-            except Exception as e:
-                # print(f"DEBUG: Exception in internal bbox: {e}")
-                return None, None, None, None
-                #return 0, 0, self.canvas.shape[-1], self.canvas.shape[-2]
+                        if not changed:
+                            break
+        elif mode == "external":
+            if self.canvas4model_mask is None:
+                x1, y1, x2, y2 = _original_bbox()
+            else:
+                mask = self.canvas4model_mask.squeeze()
+                coords = (mask > 0).nonzero(as_tuple=False)
+                if coords.numel() == 0:
+                    x1, y1, x2, y2 = _original_bbox()
+                else:
+                    ys = coords[:, 0]
+                    xs = coords[:, 1]
+                    x1 = int(xs.min().item())
+                    y1 = int(ys.min().item())
+                    x2 = int(xs.max().item()) + 1
+                    y2 = int(ys.max().item()) + 1
         else:
-            xs = proj_xy[:, 0]
-            ys = proj_xy[:, 1]
-            try:
-                x1 = max(0, int(torch.floor(xs.min()).item()))
-                y1 = max(0, int(torch.floor(ys.min()).item()))
-                x2 = min(self.canvas4model.shape[-1], int(torch.ceil(xs.max()).item()))
-                y2 = min(self.canvas4model.shape[-2], int(torch.ceil(ys.max()).item()))
-            except Exception as e:
-                return None, None, None, None
+            x1, y1, x2, y2 = _original_bbox()
 
+        if x1 is None or y1 is None or x2 is None or y2 is None:
+            return None, None, None, None
         if x2 <= x1 or y2 <= y1:
             # Fallback to full canvas if calculation fails (though rare)
             return 0, 0, self.canvas4model.shape[-1], self.canvas4model.shape[-2]

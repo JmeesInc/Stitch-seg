@@ -26,6 +26,7 @@ DEFAULT_CFG_VALUES = {
     "segm_input_size": 512,
     "keypoint_color": (0, 255, 255),
     "keypoint_radius": 3,
+    "inject_tool_mask": False,
     "aliked_model": "aliked-n16",
     "aliked_weights": "weights/aliked-n16.pth",
     "lightglue_weights": "weights/aliked_lightglue_v0-1_arxiv.pth",

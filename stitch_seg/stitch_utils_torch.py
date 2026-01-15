@@ -471,7 +471,11 @@ def paste_current_to_canvas_forward(
     H_total = S_canvas @ T_center @ H_to_canvas.to(device)
     
     img_to_warp = current_img.clone()
+    # NOTE:
+    # - stitch用(=canvas/canvas_mask更新)の外周trimは従来通り cfg.canvas_border_trim_px を使う
+    # - 推論用(=canvas4model_mask更新)は「端欠けで推論cropが縮む」不具合を避けるため trim無し(0固定)
     trim_px = max(0, int(getattr(cfg, "canvas_border_trim_px", 0)))
+    trim_px4model = 0
     
     # Resize mask if needed
     resized_mask = None
@@ -482,17 +486,26 @@ def paste_current_to_canvas_forward(
     ch, cw = canvas.shape[-2:]
 
     # Create & Warp Mask
-    mask = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device) # (H, W)
+    mask = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device) # (H, W) stitch用
+    mask4model = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device) # (H, W) 推論用
     if resized_mask is not None:
         mask[resized_mask.squeeze(0) > 0] = 0
+        mask4model[resized_mask.squeeze(0) > 0] = 0
         
     if trim_px > 0:
         mask[:trim_px, :] = 0
         mask[-trim_px:, :] = 0
         mask[:, :trim_px] = 0
         mask[:, -trim_px:] = 0
+
+    if trim_px4model > 0:
+        mask4model[:trim_px4model, :] = 0
+        mask4model[-trim_px4model:, :] = 0
+        mask4model[:, :trim_px4model] = 0
+        mask4model[:, -trim_px4model:] = 0
         
     mask_b = mask.unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
+    mask4model_b = mask4model.unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
 
     # ---- Batch warp (image + mask + tool_mask) to reduce overhead ----
     # Kornia warp expects (B, C, H, W). We pack everything into channels and warp once.
@@ -504,7 +517,8 @@ def paste_current_to_canvas_forward(
         rm_b = torch.zeros_like(mask_b)
 
     c_img = img_to_warp.shape[1]
-    packed = torch.cat([img_to_warp.float(), mask_b, rm_b], dim=1)  # (1, C+2, H, W)
+    # packed: image + stitch用mask + 推論用mask + tool_mask
+    packed = torch.cat([img_to_warp.float(), mask_b, mask4model_b, rm_b], dim=1)  # (1, C+3, H, W)
     warped_packed = kornia.geometry.transform.warp_perspective(
         packed,
         (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
@@ -515,15 +529,19 @@ def paste_current_to_canvas_forward(
 
     warped = warped_packed[:, :c_img].to(canvas.dtype)
     warped_mask = warped_packed[:, c_img:c_img + 1]
-    warped_tool_mask = warped_packed[:, c_img + 1:c_img + 2]
+    warped_mask4model = warped_packed[:, c_img + 1:c_img + 2]
+    warped_tool_mask = warped_packed[:, c_img + 2:c_img + 3]
 
     # Bool Logic
     wm_bool = warped_mask > 0.5 # currentがいる領域
+    wm4_bool = warped_mask4model > 0.5 # currentがいる領域（推論用: trim無し等）
     cm_bool = canvas_mask > 0 # canvasのある領域
     wtm_bool = warped_tool_mask > 0.5 # tool他maskのある領域
     
     overlap = wm_bool &cm_bool & (~wtm_bool)
+    overlap4model = wm4_bool & cm_bool & (~wtm_bool)
     only_new = wm_bool & (~cm_bool) & (~wtm_bool) # canvasになかった領域
+    only_new4model = wm4_bool & (~cm_bool) & (~wtm_bool) # canvasになかった領域（推論用: trim無し等）
 
     # Blur等で「前フレームcanvasをベースに、新規領域だけ」反映したい場合
     # - overlap領域は一切更新しない（ブレたフレームの色を混ぜない）
@@ -531,14 +549,16 @@ def paste_current_to_canvas_forward(
     if str(update_mode).lower() in ("only_new", "only-new", "onlynew"):
         if only_new.any():
             canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
-            canvas4model.masked_scatter_(only_new.expand_as(canvas4model), warped[only_new.expand_as(warped)])
+            canvas4model.masked_scatter_(only_new4model.expand_as(canvas4model), warped[only_new4model.expand_as(warped)])
         canvas_mask[wm_bool] = 255
-        canvas4model_mask[wm_bool] = 255
+        # 推論用maskは「stitch用trimの影響」を受けない投影マスクで更新
+        canvas4model_mask[wm4_bool] = 255
         return canvas, canvas_mask, canvas4model, canvas4model_mask
 
     # Update Canvas
     if only_new.any():
         canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
+        canvas4model.masked_scatter_(only_new4model.expand_as(canvas4model), warped[only_new4model.expand_as(warped)])
     if overlap.any():
         # mask_b (1, 1, H, W) を複製
         grad_mask = mask_b.clone()
@@ -570,7 +590,8 @@ def paste_current_to_canvas_forward(
         )
         blended_alpha = alpha_overlap * warped_grad_alpha
         
-        overlap_expanded = overlap.expand_as(canvas)       
+        overlap_expanded = overlap.expand_as(canvas)   
+        overlap4model_expanded = overlap4model.expand_as(canvas4model)    
         alpha_expanded = blended_alpha.expand_as(canvas)   
         
         c_vals = canvas[overlap_expanded].float()
@@ -582,7 +603,7 @@ def paste_current_to_canvas_forward(
         
         # Canvasに書き戻し
         canvas[overlap_expanded] = blended_vals.to(canvas.dtype)
-        canvas4model[overlap_expanded] = c_vals.to(canvas4model.dtype)
+        canvas4model[overlap4model_expanded] = c_vals.to(canvas4model.dtype)
 
         
 
@@ -616,7 +637,8 @@ def paste_current_to_canvas_forward(
 
     # Update Mask
     canvas_mask[wm_bool] = 255
-    canvas4model_mask[wm_bool] = 255
+    # 推論用maskは「stitch用trimの影響」を受けない投影マスクで更新
+    canvas4model_mask[wm4_bool] = 255
     return canvas, canvas_mask, canvas4model, canvas4model_mask
 
 
@@ -885,6 +907,7 @@ def paste_current_to_canvas_forward_poisson(
     
     img_to_warp = current_img.clone()
     trim_px = max(0, int(getattr(cfg, "canvas_border_trim_px", 0)))
+    trim_px4model = 0
     
     # MaskのResizeと適用
     resized_mask = None
@@ -907,17 +930,26 @@ def paste_current_to_canvas_forward_poisson(
     ch, cw = canvas.shape[-2:]
 
     # Mask生成
-    mask = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device)
+    mask = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device)      # stitch用
+    mask4model = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device) # 推論用
     if resized_mask is not None:
         mask[resized_mask > 0] = 0
+        mask4model[resized_mask > 0] = 0
         
     if trim_px > 0:
         mask[:trim_px, :] = 0
         mask[-trim_px:, :] = 0
         mask[:, :trim_px] = 0
         mask[:, -trim_px:] = 0
+
+    if trim_px4model > 0:
+        mask4model[:trim_px4model, :] = 0
+        mask4model[-trim_px4model:, :] = 0
+        mask4model[:, :trim_px4model] = 0
+        mask4model[:, -trim_px4model:] = 0
         
     mask_b = mask.unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
+    mask4model_b = mask4model.unsqueeze(0).unsqueeze(0) # (1, 1, H, W)
 
     # ---- Batch warp (image + geometry mask + tool mask) to reduce overhead ----
     # All share H_total, dsize and nearest mode -> pack into channels and warp once.
@@ -929,7 +961,7 @@ def paste_current_to_canvas_forward_poisson(
         rm_b = torch.zeros_like(mask_b)
 
     c_img = img_to_warp.shape[1]
-    packed = torch.cat([img_to_warp.float(), mask_b, rm_b], dim=1)  # (1, C+2, H, W)
+    packed = torch.cat([img_to_warp.float(), mask_b, mask4model_b, rm_b], dim=1)  # (1, C+3, H, W)
     warped_packed = kornia.geometry.transform.warp_perspective(
         packed,
         (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
@@ -939,23 +971,27 @@ def paste_current_to_canvas_forward_poisson(
     )
     warped = warped_packed[:, :c_img].to(canvas.dtype)
     warped_mask = warped_packed[:, c_img:c_img + 1]
-    warped_tool_mask = warped_packed[:, c_img + 1:c_img + 2]
+    warped_mask4model = warped_packed[:, c_img + 1:c_img + 2]
+    warped_tool_mask = warped_packed[:, c_img + 2:c_img + 3]
 
     # 領域判定
     wm_bool = warped_mask > 0.5 
+    wm4_bool = warped_mask4model > 0.5
     cm_bool = canvas_mask > 0 
     wtm_bool = warped_tool_mask > 0.5 
     
     overlap = wm_bool & cm_bool & (~wtm_bool)
+    overlap4model = wm4_bool & cm_bool & (~wtm_bool)
     only_new = wm_bool & (~cm_bool) & (~wtm_bool)
+    only_new4model = wm4_bool & (~cm_bool) & (~wtm_bool)
 
     if str(update_mode).lower() in ("only_new", "only-new", "onlynew"):
         # only_new だけ更新（overlapは更新しない）
         if only_new.any():
             canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
-            canvas4model.masked_scatter_(only_new.expand_as(canvas4model), warped[only_new.expand_as(warped)])
+            canvas4model.masked_scatter_(only_new4model.expand_as(canvas4model), warped[only_new4model.expand_as(warped)])
         canvas_mask[wm_bool] = 255
-        canvas4model_mask[wm_bool] = 255
+        canvas4model_mask[wm4_bool] = 255
         return canvas, canvas_mask, canvas4model, canvas4model_mask
 
     # --- 3. 描画処理 (Poisson Blending) ---
@@ -973,7 +1009,7 @@ def paste_current_to_canvas_forward_poisson(
     # これにより、overlap領域のブレンド計算時に「新しい外側の色」が境界条件として使われます
     if only_new.any():
         canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
-        canvas4model.masked_scatter_(only_new.expand_as(canvas4model), warped[only_new.expand_as(warped)])
+        canvas4model.masked_scatter_(only_new4model.expand_as(canvas4model), warped[only_new4model.expand_as(warped)])
     # Step 2: 重なり領域 (overlap) に対して Poisson Blending を適用
     if overlap.any():
         # ROI (Region of Interest) の計算
@@ -1023,17 +1059,31 @@ def paste_current_to_canvas_forward_poisson(
                 canvas_roi = canvas[..., min_y:max_y, min_x:max_x]
                 canvas4model_roi = canvas4model[..., min_y:max_y, min_x:max_x]
                 overlap_roi = overlap[..., min_y:max_y, min_x:max_x]
+                overlap4model_roi = overlap4model[..., min_y:max_y, min_x:max_x]
+                warped_roi_b = warped[..., min_y:max_y, min_x:max_x]
                 
                 canvas_roi.masked_scatter_(overlap_roi.expand_as(canvas_roi), blended_roi.unsqueeze(0)[overlap_roi.expand_as(canvas_roi)])
-                canvas4model_roi.masked_scatter_(overlap_roi.expand_as(canvas4model_roi), blended_roi.unsqueeze(0)[overlap_roi.expand_as(canvas4model_roi)])
+                # 推論用canvas4model:
+                # - 通常のoverlapはブレンド結果を入れる
+                # - overlap4modelで追加された分（trim無しで増えた領域）は current(warped) を入れる
+                canvas4model_roi.masked_scatter_(
+                    overlap_roi.expand_as(canvas4model_roi),
+                    blended_roi.unsqueeze(0)[overlap_roi.expand_as(canvas4model_roi)]
+                )
+                extra4 = overlap4model_roi & (~overlap_roi)
+                if extra4.any():
+                    canvas4model_roi.masked_scatter_(
+                        extra4.expand_as(canvas4model_roi),
+                        warped_roi_b[extra4.expand_as(canvas4model_roi)]
+                    )
             except Exception as e:
                 print(f"Blending Error: {e}")
                 # フォールバック：単純上書き
                 canvas.masked_scatter_(overlap.expand_as(canvas), warped[overlap.expand_as(warped)])
-                canvas4model.masked_scatter_(overlap.expand_as(canvas4model), warped[overlap.expand_as(warped)])
+                canvas4model.masked_scatter_(overlap4model.expand_as(canvas4model), warped[overlap4model.expand_as(warped)])
     # Update Mask
     canvas_mask[wm_bool] = 255
-    canvas4model_mask[wm_bool] = 255
+    canvas4model_mask[wm4_bool] = 255
     return canvas, canvas_mask, canvas4model, canvas4model_mask
 # Helper (依存関係維持)
 def translation_matrix_from_offset(offset_xy, device):
@@ -1095,6 +1145,7 @@ def paste_current_to_canvas_forward_multiband(
     
     img_to_warp = current_img.clone()
     trim_px = max(0, int(getattr(cfg, "canvas_border_trim_px", 0)))
+    trim_px4model = 0
     
     # Mask out tool in input image to prevent color bleeding
     resized_mask = None
@@ -1105,13 +1156,19 @@ def paste_current_to_canvas_forward_multiband(
     ch, cw = canvas.shape[-2:]
 
     # Warp Masks (geometry mask + tool mask)
-    mask = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device)
+    mask = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device)      # stitch用
+    mask4model = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device) # 推論用
     if resized_mask is not None:
         mask[resized_mask.squeeze(0) > 0] = 0
+        mask4model[resized_mask.squeeze(0) > 0] = 0
     if trim_px > 0:
         mask[:trim_px, :] = 0; mask[-trim_px:, :] = 0; mask[:, :trim_px] = 0; mask[:, -trim_px:] = 0
+
+    if trim_px4model > 0:
+        mask4model[:trim_px4model, :] = 0; mask4model[-trim_px4model:, :] = 0; mask4model[:, :trim_px4model] = 0; mask4model[:, -trim_px4model:] = 0
         
     mask_b = mask.unsqueeze(0).unsqueeze(0)
+    mask4model_b = mask4model.unsqueeze(0).unsqueeze(0)
 
     # ---- Batch warp (image + geometry mask + tool mask) to reduce overhead ----
     # All share H_total, dsize and nearest mode -> pack into channels and warp once.
@@ -1123,30 +1180,35 @@ def paste_current_to_canvas_forward_multiband(
         rm_b = torch.zeros_like(mask_b)
 
     c_img = img_to_warp.shape[1]
-    packed = torch.cat([img_to_warp.float(), mask_b, rm_b], dim=1)  # (1, C+2, H, W)
+    packed = torch.cat([img_to_warp.float(), mask_b, mask4model_b, rm_b], dim=1)  # (1, C+3, H, W)
     warped_packed = kornia.geometry.transform.warp_perspective(
         packed, (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
     )
     warped = warped_packed[:, :c_img].to(canvas.dtype)
     warped_mask = warped_packed[:, c_img:c_img + 1]
-    warped_tool_mask = warped_packed[:, c_img + 1:c_img + 2]
+    warped_mask4model = warped_packed[:, c_img + 1:c_img + 2]
+    warped_tool_mask = warped_packed[:, c_img + 2:c_img + 3]
 
     # Logic Masks (Binary)
     wm_bool = warped_mask > 0.5
+    wm4_bool = warped_mask4model > 0.5
     cm_bool = canvas_mask > 0
     wtm_bool = warped_tool_mask > 0.5
     
     valid_new_region = wm_bool & (~wtm_bool)
+    valid_new_region4model = wm4_bool & (~wtm_bool)
     
     overlap = valid_new_region & cm_bool
+    overlap4model = valid_new_region4model & cm_bool
     only_new = valid_new_region & (~cm_bool)
+    only_new4model = valid_new_region4model & (~cm_bool)
 
     if str(update_mode).lower() in ("only_new", "only-new", "onlynew"):
         if only_new.any():
             canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
-            canvas4model.masked_scatter_(only_new.expand_as(canvas4model), warped[only_new.expand_as(warped)])
+            canvas4model.masked_scatter_(only_new4model.expand_as(canvas4model), warped[only_new4model.expand_as(warped)])
         canvas_mask[valid_new_region] = 255
-        canvas4model_mask[valid_new_region] = 255
+        canvas4model_mask[valid_new_region4model] = 255
         return canvas, canvas_mask, canvas4model, canvas4model_mask
 
     # Initialization case
@@ -1158,7 +1220,7 @@ def paste_current_to_canvas_forward_multiband(
     # Update non-overlapping area
     if only_new.any():
         canvas.masked_scatter_(only_new.expand_as(canvas), warped[only_new.expand_as(warped)])
-        canvas4model.masked_scatter_(only_new.expand_as(canvas4model), warped[only_new.expand_as(warped)])
+        canvas4model.masked_scatter_(only_new4model.expand_as(canvas4model), warped[only_new4model.expand_as(warped)])
     
     # --- 2. Multiband Blending Logic with Mask Smoothing ---
     if overlap.any():
@@ -1179,6 +1241,7 @@ def paste_current_to_canvas_forward_multiband(
             
             # Base Mask from Geometry
             roi_mask = valid_new_region[..., y_min:y_max, x_min:x_max].float()
+            roi_mask4model = valid_new_region4model[..., y_min:y_max, x_min:x_max].float()
             
             # マスクの強度が下がりすぎないように正規化する場合もありますが、
             # ブレンド用としては0~1のグラデーションが重要なのでそのままでOK
@@ -1211,6 +1274,7 @@ def paste_current_to_canvas_forward_multiband(
             paste_alpha_radius = int(getattr(cfg, "gradient_radius", 201))
             
             roi_mask_bin = (roi_mask > 0.5).float()
+            roi_mask4model_bin = (roi_mask4model > 0.5).float()
             inv_mask = 1.0 - roi_mask_bin  # outside=1, inside=0
             # ROI crop境界も「外側」とみなして必ずフェード帯ができるようにする
             inv_mask[..., 0, :] = 1.0
@@ -1231,11 +1295,15 @@ def paste_current_to_canvas_forward_multiband(
             
             blended_result = canvas_crop * (1.0 - update_weight) + roi_blended.to(canvas.dtype) * update_weight
             canvas[..., y_min:y_max, x_min:x_max] = blended_result
-            canvas4model[..., y_min:y_max, x_min:x_max] = roi_blended.to(canvas4model.dtype)
-
+            # 推論用canvas4modelはtrim無しfootprintに基づくマスクで更新する
+            canvas4model[..., y_min:y_max, x_min:x_max] = (
+                roi_blended.to(canvas4model.dtype) * roi_mask4model_bin.unsqueeze(0).unsqueeze(0)
+                + canvas4model[..., y_min:y_max, x_min:x_max] * (1 - roi_mask4model_bin).unsqueeze(0).unsqueeze(0).to(canvas4model.dtype)
+            )
+            
     # Update Mask
     canvas_mask[valid_new_region] = 255
-    canvas4model_mask[valid_new_region] = 255
+    canvas4model_mask[valid_new_region4model] = 255
     return canvas, canvas_mask, canvas4model, canvas4model_mask
 
 def fast_gradient_mask(mask: torch.Tensor, radius: int, scale_factor: float = 0.125) -> torch.Tensor:
