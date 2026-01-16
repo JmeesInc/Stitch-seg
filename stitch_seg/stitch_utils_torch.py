@@ -1133,6 +1133,7 @@ def paste_current_to_canvas_forward_multiband(
     """
     Multiband Blending with Mask Softening (Erosion + Gaussian Blur).
     """
+    #TODO canvas4modelのtrimされちゃう問題修正
     device = current_img.device
     scale = getattr(cfg, "canvas_superres_scale", 1.0)
     canvas4model = canvas.clone()
@@ -1158,15 +1159,17 @@ def paste_current_to_canvas_forward_multiband(
     # Warp Masks (geometry mask + tool mask)
     mask = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device)      # stitch用
     mask4model = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device) # 推論用
+    edge_trim_mask = torch.ones_like(mask)
     if resized_mask is not None:
         mask[resized_mask.squeeze(0) > 0] = 0
         mask4model[resized_mask.squeeze(0) > 0] = 0
     if trim_px > 0:
-        mask[:trim_px, :] = 0; mask[-trim_px:, :] = 0; mask[:, :trim_px] = 0; mask[:, -trim_px:] = 0
-
+        #mask[:trim_px, :] = 0; mask[-trim_px:, :] = 0; mask[:, :trim_px] = 0; mask[:, -trim_px:] = 0
+        edge_trim_mask[:trim_px, :] = 0; edge_trim_mask[-trim_px:, :] = 0; edge_trim_mask[:, :trim_px] = 0; edge_trim_mask[:, -trim_px:] = 0
     if trim_px4model > 0:
         mask4model[:trim_px4model, :] = 0; mask4model[-trim_px4model:, :] = 0; mask4model[:, :trim_px4model] = 0; mask4model[:, -trim_px4model:] = 0
-        
+    
+    mask = mask * edge_trim_mask
     mask_b = mask.unsqueeze(0).unsqueeze(0)
     mask4model_b = mask4model.unsqueeze(0).unsqueeze(0)
 
@@ -1295,10 +1298,16 @@ def paste_current_to_canvas_forward_multiband(
             
             blended_result = canvas_crop * (1.0 - update_weight) + roi_blended.to(canvas.dtype) * update_weight
             canvas[..., y_min:y_max, x_min:x_max] = blended_result
-            # 推論用canvas4modelはtrim無しfootprintに基づくマスクで更新する
-            canvas4model[..., y_min:y_max, x_min:x_max] = (
-                roi_blended.to(canvas4model.dtype) * roi_mask4model_bin.unsqueeze(0).unsqueeze(0)
-                + canvas4model[..., y_min:y_max, x_min:x_max] * (1 - roi_mask4model_bin).unsqueeze(0).unsqueeze(0).to(canvas4model.dtype)
+            
+            # 推論用canvas4modelは「ブレンド結果」ではなく、warpedを正しい場所にそのまま貼り付ける
+            # (trim無しfootprintに基づくマスクで更新する)
+            canvas4model_crop = canvas4model[..., y_min:y_max, x_min:x_max]
+            mask4_bool = (roi_mask4model > 0.5)
+            mask4_bool = mask4_bool.expand_as(roi_warped)
+            canvas4model[..., y_min:y_max, x_min:x_max] = torch.where(
+                mask4_bool,
+                roi_warped.to(canvas4model.dtype),
+                canvas4model_crop,
             )
             
     # Update Mask

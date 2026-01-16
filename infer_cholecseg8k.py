@@ -1,7 +1,7 @@
 """Run segmentation on a stitched canvas using StitchInferencer."""
 import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 from typing import Optional
 
 import albumentations as A
@@ -26,12 +26,12 @@ from model import UnetPlusPlus
 class CFG:
     #video_path = "/mnt/devices/dl2/ex-data-2/data11/share/TLH/standardized_videos/001510725.mp4"
     video_path = "video01.mp4"
-    start_frame = 29000
-    end_frame = 30000
+    start_frame = 28000
+    end_frame = 29000
     enable_depth_mask = False
     output_dir = "0114_check"
     method = "pyramid"
-    bbox_mode = "internal"
+    bbox_mode = "external"
     apply_ellipse_mask = True
     laplacian_var_min = 60
     segmentation_weights = "weights/fold0.pth"
@@ -45,7 +45,7 @@ class CFG:
 
     debug = True
     debug_dir = "0114_check"
-    debug_video_filename = "internal.mp4"
+    debug_video_filename = "external.mp4"
 
 class CanvasSegModel(nn.Module):
     def __init__(self, cfg):
