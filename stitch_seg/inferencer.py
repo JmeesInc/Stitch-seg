@@ -167,7 +167,7 @@ class StitchInferencer(nn.Module):
             return None
         max_contour = max(contours, key=cv2.contourArea)
         (x, y), radius = cv2.minEnclosingCircle(max_contour)
-        radius -= self.cfg.canvas_border_trim_px
+        radius -= 4
         mask = cv2.circle(mask, (int(x), int(y)), int(radius), 1, -1)
         mask = np.ones_like(mask) - mask
         self.ellipse_mask = torch.from_numpy(mask).to(self.device).unsqueeze(0).unsqueeze(0)
@@ -474,12 +474,16 @@ class StitchInferencer(nn.Module):
                 )
             self.last_tool_mask = tool_mask_raw.clone()
     
-    def step_canvas(self, frame_u: torch.Tensor):
+    def step_canvas(self, frame_u: torch.Tensor, transform: str = "homography"):
         """
         Main logic step.
         frame_u: (1, 3, H, W) RGB Float
+        transform: "homography" (default) or "tps"
         """
         with torch.autocast(device_type=self.device.type, dtype=torch.float16):
+            transform_mode = str(transform).lower() if transform is not None else "homography"
+            use_tps = transform_mode == "tps"
+            tps_params = None
             # === 1. Predict Masks ===
             tool_mask_raw, depth_mask_raw = self._predict_masks(frame_u)
             # === 2. Convert to Grayscale for Flow ===
@@ -525,6 +529,11 @@ class StitchInferencer(nn.Module):
                     return
                 H_cum_curr = self.H_cum @ H_inv
 
+            if use_tps and curr_feats is not None and self.prev_feats is not None:
+                tps_params = self.estimate_tps_params(self.prev_feats, curr_feats)
+                if tps_params is None:
+                    use_tps = False
+
             # === 8. Paste Current Frame to Canvas (update canvas) ===
             # self.canvas4model/self.canvas4model_mask: current frame inference用なので、blurでも更新してよい
             # self.canvas/self.canvas_mask: 次フレームの推論に使うので、blur時は更新しない
@@ -548,6 +557,7 @@ class StitchInferencer(nn.Module):
                     self.cfg,
                     self.cfg.alpha_overlap,
                     update_mode=update_mode,
+                    tps_params=tps_params if use_tps else None,
                 )
             elif self.cfg.method == "poisson":
                 new_canvas, new_canvas_mask, self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward_poisson(
@@ -560,6 +570,7 @@ class StitchInferencer(nn.Module):
                     self.cfg,
                     self.cfg.alpha_overlap,
                     update_mode=update_mode,
+                    tps_params=tps_params if use_tps else None,
                 )
             else:
                 new_canvas, new_canvas_mask, self.canvas4model, self.canvas4model_mask = paste_current_to_canvas_forward(
@@ -572,6 +583,7 @@ class StitchInferencer(nn.Module):
                     self.cfg,
                     self.cfg.alpha_overlap,
                     update_mode=update_mode,
+                    tps_params=tps_params if use_tps else None,
                 )
                 # 次フレーム用のbase canvasは、blur時は更新しない
             if not blur:
@@ -725,3 +737,48 @@ class StitchInferencer(nn.Module):
             H_est, mask = ransac(pts_prev, pts_curr, weights=scores[0])
         H_est = H_est.squeeze(0) # (3, 3)
         return H_est
+
+    def estimate_tps_params(self, prev_feats, curr_feats, min_matches: int = 10):
+        """
+        Estimate TPS parameters that map canvas coords -> current image coords.
+        """
+        if prev_feats is None or curr_feats is None:
+            return None
+
+        with torch.inference_mode():
+            result = self.matcher({"image0": prev_feats, "image1": curr_feats})
+
+        matches = result.get("matches")
+        if matches is None:
+            return None
+
+        match_idx = matches[0]
+        if match_idx.shape[0] < max(min_matches, 4):
+            return None
+
+        kp_prev = prev_feats["keypoints"][0].to(torch.float32)
+        kp_curr = curr_feats["keypoints"][0].to(torch.float32)
+
+        pts_prev = kp_prev[match_idx[:, 0]]
+        pts_curr = kp_curr[match_idx[:, 1]]
+
+        H_prev_to_canvas = self._current_to_canvas_h().to(torch.float32)
+        ones = torch.ones((pts_prev.shape[0], 1), device=pts_prev.device, dtype=pts_prev.dtype)
+        pts_prev_h = torch.cat([pts_prev, ones], dim=1)
+        pts_canvas = (H_prev_to_canvas @ pts_prev_h.T).T
+        denom = pts_canvas[:, 2:3].clamp(min=1e-6)
+        pts_canvas_xy = pts_canvas[:, :2] / denom
+
+        if not torch.isfinite(pts_canvas_xy).all():
+            return None
+
+        kernel_weights, affine_weights = kornia.geometry.transform.get_tps_transform(
+            pts_canvas_xy.unsqueeze(0),
+            pts_curr.unsqueeze(0),
+        )
+        kernel_centers = pts_curr.unsqueeze(0)
+
+        if not torch.isfinite(kernel_weights).all() or not torch.isfinite(affine_weights).all():
+            return None
+
+        return kernel_centers, kernel_weights, affine_weights
