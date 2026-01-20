@@ -287,6 +287,25 @@ def warp_with_transform(img: torch.Tensor, H: torch.Tensor, output_shape=None, i
     return warped
 
 
+def _build_tps_grid(output_shape, input_shape, kernel_centers, kernel_weights, affine_weights):
+    """Build a grid_sample-ready TPS grid mapping output -> input (pixel coords)."""
+    out_h, out_w = int(output_shape[0]), int(output_shape[1])
+    in_h, in_w = int(input_shape[0]), int(input_shape[1])
+    device = kernel_centers.device
+    dtype = kernel_centers.dtype
+    batch_size = kernel_centers.shape[0]
+    grid = kornia.utils.create_meshgrid(
+        out_h, out_w, normalized_coordinates=False, device=device, dtype=dtype
+    )
+    grid = grid.reshape(1, -1, 2).expand(batch_size, -1, -1)
+    warped = kornia.geometry.transform.warp_points_tps(
+        grid, kernel_centers, kernel_weights, affine_weights
+    )
+    warped = warped.view(batch_size, out_h, out_w, 2)
+    grid_norm = kornia.geometry.normalize_pixel_coordinates(warped, in_h, in_w)
+    return grid_norm
+
+
 def compute_optical_flow_mask(flow_tensor: torch.Tensor, base_mask: torch.Tensor, cfg):
     """
     Calculates statistics and motion mask from a PRE-CALCULATED flow tensor.
@@ -439,6 +458,7 @@ def paste_current_to_canvas_forward(
     cfg,
     alpha_overlap=0.80,
     update_mode: str = "full",
+    tps_params=None,
 ):
     """
     All inputs are Tensors (B, C, H, W) or similar.
@@ -463,12 +483,13 @@ def paste_current_to_canvas_forward(
     canvas4model = canvas.clone()
     canvas4model_mask = canvas_mask.clone()
     
-    # Translation Matrix
-    T_center = translation_matrix_from_offset(offset_xy, device=device)
-    S_canvas = torch.tensor([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
-    
-    # Apply canvas super-res scale first, then translate to the canvas center.
-    H_total = S_canvas @ T_center @ H_to_canvas.to(device)
+    use_tps = tps_params is not None
+    if not use_tps:
+        # Translation Matrix
+        T_center = translation_matrix_from_offset(offset_xy, device=device)
+        S_canvas = torch.tensor([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
+        # Apply canvas super-res scale first, then translate to the canvas center.
+        H_total = S_canvas @ T_center @ H_to_canvas.to(device)
     
     img_to_warp = current_img.clone()
     # NOTE:
@@ -477,12 +498,22 @@ def paste_current_to_canvas_forward(
     trim_px = max(0, int(getattr(cfg, "canvas_border_trim_px", 0)))
     trim_px4model = 0
     
-    # Resize mask if needed
+    # Resize/normalize tool mask to 2D (H, W) uint8
     resized_mask = None
     if tool_mask is not None:
-        resized_mask = tool_mask.to(torch.uint8).squeeze(0)
-        # Mask out tool in input
-        img_to_warp.masked_fill_(resized_mask > 0, 0)
+        tm = tool_mask
+        # Accept (H,W), (1,H,W), (1,1,H,W)
+        if tm.dim() == 4:
+            tm = tm[0, 0]
+        elif tm.dim() == 3:
+            tm = tm[0] if tm.shape[0] == 1 else tm.squeeze(0)
+        if tm.dim() != 2:
+            raise ValueError(f"tool_mask must be (H,W)/(1,H,W)/(1,1,H,W), got {tuple(tool_mask.shape)}")
+        if tm.shape[-2:] != img_to_warp.shape[-2:]:
+            tm = F.interpolate(tm.float().unsqueeze(0).unsqueeze(0), size=img_to_warp.shape[-2:], mode="nearest").squeeze(0).squeeze(0)
+        resized_mask = tm.to(torch.uint8)
+        # Mask out tool in input (broadcast along channels)
+        img_to_warp.masked_fill_(resized_mask.unsqueeze(0).unsqueeze(0) > 0, 0)
     ch, cw = canvas.shape[-2:]
 
     # Create & Warp Mask
@@ -510,22 +541,34 @@ def paste_current_to_canvas_forward(
     # ---- Batch warp (image + mask + tool_mask) to reduce overhead ----
     # Kornia warp expects (B, C, H, W). We pack everything into channels and warp once.
     if resized_mask is not None:
-        rm_b = resized_mask.float().unsqueeze(0)
-        if rm_b.dim() == 3:
-            rm_b = rm_b.unsqueeze(0)  # (1, 1, H, W)
+        rm_b = resized_mask.float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
     else:
         rm_b = torch.zeros_like(mask_b)
 
     c_img = img_to_warp.shape[1]
     # packed: image + stitch用mask + 推論用mask + tool_mask
     packed = torch.cat([img_to_warp.float(), mask_b, mask4model_b, rm_b], dim=1)  # (1, C+3, H, W)
-    warped_packed = kornia.geometry.transform.warp_perspective(
-        packed,
-        (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
-        dsize=(ch, cw),
-        mode='nearest',
-        padding_mode='zeros',
-    )
+    if use_tps:
+        kernel_centers, kernel_weights, affine_weights = tps_params
+        kernel_centers = kernel_centers.to(torch.float32)
+        kernel_weights = kernel_weights.to(torch.float32)
+        affine_weights = affine_weights.to(torch.float32)
+        tps_grid = _build_tps_grid((ch, cw), current_img.shape[-2:], kernel_centers, kernel_weights, affine_weights)
+        warped_packed = F.grid_sample(
+            packed.float(),
+            tps_grid,
+            mode='nearest',
+            padding_mode='zeros',
+            align_corners=True,
+        )
+    else:
+        warped_packed = kornia.geometry.transform.warp_perspective(
+            packed,
+            (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
+            dsize=(ch, cw),
+            mode='nearest',
+            padding_mode='zeros',
+        )
 
     warped = warped_packed[:, :c_img].to(canvas.dtype)
     warped_mask = warped_packed[:, c_img:c_img + 1]
@@ -582,12 +625,21 @@ def paste_current_to_canvas_forward(
             # 万が一計算できない場合は、全体を1.0（ベタ塗り）にするフォールバック
             grad_alpha = torch.ones_like(dist_transform)
             
-        warped_grad_alpha = kornia.geometry.transform.warp_perspective(
-            grad_alpha,
-            (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
-            dsize=(ch, cw),
-            mode='bilinear' # アルファマップは滑らかにしたいのでbilinear推奨
-        )
+        if use_tps:
+            warped_grad_alpha = F.grid_sample(
+                grad_alpha,
+                tps_grid,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True,
+            )
+        else:
+            warped_grad_alpha = kornia.geometry.transform.warp_perspective(
+                grad_alpha,
+                (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
+                dsize=(ch, cw),
+                mode='bilinear' # アルファマップは滑らかにしたいのでbilinear推奨
+            )
         blended_alpha = alpha_overlap * warped_grad_alpha
         
         overlap_expanded = overlap.expand_as(canvas)   
@@ -890,6 +942,7 @@ def paste_current_to_canvas_forward_poisson(
     cfg,
     alpha_overlap=0.45,
     update_mode: str = "full",
+    tps_params=None,
 ):
     """
     Poisson Blendingを用いた貼り付け処理
@@ -900,31 +953,30 @@ def paste_current_to_canvas_forward_poisson(
     canvas4model_mask = canvas_mask.clone()
     
     # --- 1. Warpの準備 ---
-    T_center = translation_matrix_from_offset(offset_xy, device=device)
-    S_canvas = torch.tensor([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
-    
-    H_total = T_center @ S_canvas @ H_to_canvas.to(device)
+    use_tps = tps_params is not None
+    if not use_tps:
+        T_center = translation_matrix_from_offset(offset_xy, device=device)
+        S_canvas = torch.tensor([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
+        H_total = T_center @ S_canvas @ H_to_canvas.to(device)
     
     img_to_warp = current_img.clone()
     trim_px = max(0, int(getattr(cfg, "canvas_border_trim_px", 0)))
     trim_px4model = 0
     
-    # MaskのResizeと適用
+    # MaskのResizeと適用: tool_mask -> (H, W) uint8
     resized_mask = None
     if tool_mask is not None:
         tm = tool_mask
-        if tm.dim() == 2: tm = tm.unsqueeze(0).unsqueeze(0)
-        elif tm.dim() == 3: tm = tm.unsqueeze(0)
-
+        if tm.dim() == 4:
+            tm = tm[0, 0]
+        elif tm.dim() == 3:
+            tm = tm[0] if tm.shape[0] == 1 else tm.squeeze(0)
+        if tm.dim() != 2:
+            raise ValueError(f"tool_mask must be (H,W)/(1,H,W)/(1,1,H,W), got {tuple(tool_mask.shape)}")
         if tm.shape[-2:] != img_to_warp.shape[-2:]:
-            resized_mask = F.interpolate(tm.float(), size=img_to_warp.shape[-2:], mode='nearest')
-        else:
-            resized_mask = tm
-        resized_mask = resized_mask.to(torch.uint8)
-        if resized_mask.dim() == 4: resized_mask = resized_mask.squeeze(0)
-        if resized_mask.dim() == 3: resized_mask = resized_mask.squeeze(0)
-        
-        img_to_warp.masked_fill_(resized_mask > 0, 0)
+            tm = F.interpolate(tm.float().unsqueeze(0).unsqueeze(0), size=img_to_warp.shape[-2:], mode="nearest").squeeze(0).squeeze(0)
+        resized_mask = tm.to(torch.uint8)
+        img_to_warp.masked_fill_(resized_mask.unsqueeze(0).unsqueeze(0) > 0, 0)
 
     # --- 2. Warp実行 ---
     ch, cw = canvas.shape[-2:]
@@ -954,21 +1006,33 @@ def paste_current_to_canvas_forward_poisson(
     # ---- Batch warp (image + geometry mask + tool mask) to reduce overhead ----
     # All share H_total, dsize and nearest mode -> pack into channels and warp once.
     if resized_mask is not None:
-        rm_b = resized_mask.float().unsqueeze(0)
-        if rm_b.dim() == 3:
-            rm_b = rm_b.unsqueeze(0)  # (1, 1, H, W)
+        rm_b = resized_mask.float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
     else:
         rm_b = torch.zeros_like(mask_b)
 
     c_img = img_to_warp.shape[1]
     packed = torch.cat([img_to_warp.float(), mask_b, mask4model_b, rm_b], dim=1)  # (1, C+3, H, W)
-    warped_packed = kornia.geometry.transform.warp_perspective(
-        packed,
-        (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
-        dsize=(ch, cw),
-        mode='nearest',
-        padding_mode='zeros',
-    )
+    if use_tps:
+        kernel_centers, kernel_weights, affine_weights = tps_params
+        kernel_centers = kernel_centers.to(torch.float32)
+        kernel_weights = kernel_weights.to(torch.float32)
+        affine_weights = affine_weights.to(torch.float32)
+        tps_grid = _build_tps_grid((ch, cw), current_img.shape[-2:], kernel_centers, kernel_weights, affine_weights)
+        warped_packed = F.grid_sample(
+            packed.float(),
+            tps_grid,
+            mode='nearest',
+            padding_mode='zeros',
+            align_corners=True,
+        )
+    else:
+        warped_packed = kornia.geometry.transform.warp_perspective(
+            packed,
+            (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
+            dsize=(ch, cw),
+            mode='nearest',
+            padding_mode='zeros',
+        )
     warped = warped_packed[:, :c_img].to(canvas.dtype)
     warped_mask = warped_packed[:, c_img:c_img + 1]
     warped_mask4model = warped_packed[:, c_img + 1:c_img + 2]
@@ -1129,6 +1193,7 @@ def paste_current_to_canvas_forward_multiband(
     canvas, canvas_mask, H_to_canvas, offset_xy, current_img, tool_mask, cfg, 
     levels=4, 
     update_mode: str = "full",
+    tps_params=None,
 ):
     """
     Multiband Blending with Mask Softening (Erosion + Gaussian Blur).
@@ -1140,19 +1205,30 @@ def paste_current_to_canvas_forward_multiband(
     canvas4model_mask = canvas_mask.clone()
     
     # --- 1. Preparation & Warping ---
-    T_center = translation_matrix_from_offset(offset_xy, device=device)
-    S_canvas = torch.tensor([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
-    H_total = S_canvas @ T_center @ H_to_canvas.to(device)
+    use_tps = tps_params is not None
+    if not use_tps:
+        T_center = translation_matrix_from_offset(offset_xy, device=device)
+        S_canvas = torch.tensor([[scale, 0.0, 0.0], [0.0, scale, 0.0], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
+        H_total = S_canvas @ T_center @ H_to_canvas.to(device)
     
     img_to_warp = current_img.clone()
     trim_px = max(0, int(getattr(cfg, "canvas_border_trim_px", 0)))
     trim_px4model = 0
     
-    # Mask out tool in input image to prevent color bleeding
+    # Mask out tool in input image to prevent bleeding: tool_mask -> (H, W) uint8
     resized_mask = None
     if tool_mask is not None:
-        resized_mask = tool_mask.to(torch.uint8).squeeze(0)
-        img_to_warp.masked_fill_(resized_mask > 0, 0)
+        tm = tool_mask
+        if tm.dim() == 4:
+            tm = tm[0, 0]
+        elif tm.dim() == 3:
+            tm = tm[0] if tm.shape[0] == 1 else tm.squeeze(0)
+        if tm.dim() != 2:
+            raise ValueError(f"tool_mask must be (H,W)/(1,H,W)/(1,1,H,W), got {tuple(tool_mask.shape)}")
+        if tm.shape[-2:] != img_to_warp.shape[-2:]:
+            tm = F.interpolate(tm.float().unsqueeze(0).unsqueeze(0), size=img_to_warp.shape[-2:], mode="nearest").squeeze(0).squeeze(0)
+        resized_mask = tm.to(torch.uint8)
+        img_to_warp.masked_fill_(resized_mask.unsqueeze(0).unsqueeze(0) > 0, 0)
 
     ch, cw = canvas.shape[-2:]
 
@@ -1161,8 +1237,8 @@ def paste_current_to_canvas_forward_multiband(
     mask4model = torch.ones(current_img.shape[-2:], dtype=torch.float32, device=device) # 推論用
     edge_trim_mask = torch.ones_like(mask)
     if resized_mask is not None:
-        mask[resized_mask.squeeze(0) > 0] = 0
-        mask4model[resized_mask.squeeze(0) > 0] = 0
+        mask[resized_mask > 0] = 0
+        mask4model[resized_mask > 0] = 0
     if trim_px > 0:
         #mask[:trim_px, :] = 0; mask[-trim_px:, :] = 0; mask[:, :trim_px] = 0; mask[:, -trim_px:] = 0
         edge_trim_mask[:trim_px, :] = 0; edge_trim_mask[-trim_px:, :] = 0; edge_trim_mask[:, :trim_px] = 0; edge_trim_mask[:, -trim_px:] = 0
@@ -1176,17 +1252,29 @@ def paste_current_to_canvas_forward_multiband(
     # ---- Batch warp (image + geometry mask + tool mask) to reduce overhead ----
     # All share H_total, dsize and nearest mode -> pack into channels and warp once.
     if resized_mask is not None:
-        rm_b = resized_mask.float().unsqueeze(0)
-        if rm_b.dim() == 3:
-            rm_b = rm_b.unsqueeze(0)  # (1, 1, H, W)
+        rm_b = resized_mask.float().unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
     else:
         rm_b = torch.zeros_like(mask_b)
 
     c_img = img_to_warp.shape[1]
     packed = torch.cat([img_to_warp.float(), mask_b, mask4model_b, rm_b], dim=1)  # (1, C+3, H, W)
-    warped_packed = kornia.geometry.transform.warp_perspective(
-        packed, (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
-    )
+    if use_tps:
+        kernel_centers, kernel_weights, affine_weights = tps_params
+        kernel_centers = kernel_centers.to(torch.float32)
+        kernel_weights = kernel_weights.to(torch.float32)
+        affine_weights = affine_weights.to(torch.float32)
+        tps_grid = _build_tps_grid((ch, cw), current_img.shape[-2:], kernel_centers, kernel_weights, affine_weights)
+        warped_packed = F.grid_sample(
+            packed.float(),
+            tps_grid,
+            mode='nearest',
+            padding_mode='zeros',
+            align_corners=True,
+        )
+    else:
+        warped_packed = kornia.geometry.transform.warp_perspective(
+            packed, (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
+        )
     warped = warped_packed[:, :c_img].to(canvas.dtype)
     warped_mask = warped_packed[:, c_img:c_img + 1]
     warped_mask4model = warped_packed[:, c_img + 1:c_img + 2]
@@ -1371,3 +1459,33 @@ def laplacian_var(img: torch.Tensor) -> torch.Tensor:
     # 3. Apply Convolution
     laplacian = F.conv2d(img, kernel, padding=1, groups=c)
     return laplacian.var(unbiased=False)
+
+# TPS wrapper using the same blending logic as paste_current_to_canvas_forward.
+def paste_current_to_canvas_tps(
+    canvas,
+    canvas_mask,
+    current_img,
+    kernel_centers,
+    kernel_weights,
+    affine_weights,
+    tool_mask,
+    cfg,
+    alpha_overlap=0.80,
+    update_mode: str = "full",
+):
+    tps_params = (kernel_centers, kernel_weights, affine_weights)
+    device = current_img.device
+    dummy_h = torch.eye(3, device=device)
+    dummy_offset = (0, 0)
+    return paste_current_to_canvas_forward(
+        canvas,
+        canvas_mask,
+        dummy_h,
+        dummy_offset,
+        current_img,
+        tool_mask,
+        cfg,
+        alpha_overlap,
+        update_mode=update_mode,
+        tps_params=tps_params,
+    )

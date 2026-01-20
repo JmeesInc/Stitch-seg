@@ -14,11 +14,13 @@ import segmentation_models_pytorch as smp
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-#from stitch_seg import StitchInferencerDev as StitchInferencer
-from stitch_seg import StitchInferencer
+from stitch_seg import StitchInferencerDev as StitchInferencer
+#from stitch_seg import StitchInferencer
 import time
 import cProfile
 import pstats
+
+from model import UnetPlusPlus
 
 
 class CFG:
@@ -27,40 +29,41 @@ class CFG:
     start_frame = 28000
     end_frame = 29000
     enable_depth_mask = False
-    output_dir = "1217_test"
+    output_dir = "0121_check"
     method = "pyramid"
     bbox_mode = "internal"
     apply_ellipse_mask = True
     laplacian_var_min = 60
-    segmentation_weights = "/mnt/devices/dl1/in-data/data4/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
-    num_classes = 1
+    segmentation_weights = "weights/fold0.pth"
+    num_classes = 13
+    backbone = "tu-convnext_base"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     # NOTE:
     # `StitchInferencer.model_inference()` can optionally inject tool mask into a class channel.
     # For binary segmentation (num_classes=1), set this to None to avoid overwriting the only channel.
-    tool_class_ch = None
+    tool_class_ch = 10
 
     debug = True
-    debug_dir = "0114_check"
-    debug_video_filename = "internal.mp4"
+    debug_dir = "0121_check"
+    debug_video_filename = "pred_canvas_forward.mp4"
 
 class CanvasSegModel(nn.Module):
     def __init__(self, cfg):
         super().__init__()
-        # 活性化関数の決定
-        activation = "sigmoid" if cfg.num_classes == 1 else "softmax"
-        
         # モデル初期化
-        self.model = smp.FPN(
-            encoder_name="efficientnet-b7",
-            encoder_weights="imagenet",
-            activation=activation,
+        self.model = UnetPlusPlus(
+            encoder_name=getattr(cfg, "backbone", "tu-convnext_base"),
+            encoder_weights=None,
             in_channels=3,
-            classes=cfg.num_classes,
+            classes=int(getattr(cfg, "num_classes", 1)),
+            # Keep raw scores/logits; downstream uses argmax for multi-class.
+            activation=None,
         ).to(cfg.device)
 
         # 重みのロード
         state = torch.load(cfg.segmentation_weights, map_location=cfg.device)
+        if isinstance(state, dict) and "state_dict" in state:
+            state = state["state_dict"]
         self.model.load_state_dict(state, strict=True)
         self.model.eval()
         
@@ -71,12 +74,10 @@ class CanvasSegModel(nn.Module):
 
     def _prepare_input(self, img_tensor: torch.Tensor):
         img_tensor = img_tensor.float() / 255.0
-        # reshape H, W to nearest values divisible by 32
         b, c, h, w = img_tensor.shape
         new_h = int(np.ceil(h / 32) * 32)
         new_w = int(np.ceil(w / 32) * 32)
-        if new_h != h or new_w != w:
-            img_tensor = F.interpolate(img_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False)
+        img_tensor = F.interpolate(img_tensor, size=(new_h, new_w), mode='bilinear', align_corners=False)
         return img_tensor
 
     def _predict_to_shape(self, tensor: torch.Tensor, target_hw) -> torch.Tensor:
@@ -152,16 +153,72 @@ def to_numpy_mask(mask):
     return mask
 
 
-def save_segmentation(mask: np.ndarray, frame_idx: int):
+def _mask_to_labels(mask, num_classes: int) -> Optional[np.ndarray]:
+    """
+    Convert various mask representations into a 2D label map (H, W) uint8.
+    Supported:
+      - torch/np: (C,H,W), (1,C,H,W), (H,W,C), (H,W)
+    """
+    if mask is None:
+        return None
+    m = to_numpy_mask(mask)
+    if m is None:
+        return None
+    m = np.asarray(m)
+
+    # Squeeze trivial dims: (1,H,W) -> (H,W), (1,C,H,W)->(C,H,W)
+    while m.ndim >= 3 and m.shape[0] == 1:
+        m = np.squeeze(m, axis=0)
+
+    if m.ndim == 2:
+        # Already a label map (or binary score map). For multi-class, assume labels.
+        if np.issubdtype(m.dtype, np.floating) and num_classes <= 2:
+            return (m >= 0.5).astype(np.uint8)
+        return m.astype(np.uint8)
+
+    if m.ndim == 3:
+        # CHW
+        if m.shape[0] == num_classes and m.shape[1] > 1 and m.shape[2] > 1:
+            labels = np.argmax(m, axis=0)
+            return labels.astype(np.uint8)
+        # HWC
+        if m.shape[2] == num_classes and m.shape[0] > 1 and m.shape[1] > 1:
+            labels = np.argmax(m, axis=2)
+            return labels.astype(np.uint8)
+        # Heuristic fallback: treat last dim as channels if >1
+        if m.shape[2] > 1:
+            labels = np.argmax(m, axis=2)
+            return labels.astype(np.uint8)
+        return np.squeeze(m).astype(np.uint8)
+
+    raise ValueError(f"Unsupported mask shape: {m.shape}")
+
+
+def _labels_to_color(labels: np.ndarray, num_classes: int) -> np.ndarray:
+    palette = build_palette(num_classes)
+    labels = labels.astype(np.int64)
+    labels = np.clip(labels, 0, palette.shape[0] - 1)
+    return palette[labels]
+
+
+def save_segmentation(mask, frame_idx: int):
+    """
+    Save segmentation result.
+    - Multi-class: saves label indices (0..num_classes-1) as a single-channel PNG.
+    - Binary: saves 0/255 mask.
+    """
     if mask is None:
         return
-    mask = to_numpy_mask(mask)
     ensure_dir(CFG.output_dir)
-    mask_single = np.squeeze(mask)
-    mask_bin = (mask_single >= 0.5).astype(np.uint8) * 100
-    mask_vis = mask_bin.astype(np.uint8)
+    labels = _mask_to_labels(mask, int(getattr(CFG, "num_classes", 1)))
+    if labels is None:
+        return
+    if int(getattr(CFG, "num_classes", 1)) <= 2:
+        out = (labels.astype(np.uint8) * 255)
+    else:
+        out = labels.astype(np.uint8)
     out_path = os.path.join(CFG.output_dir, f"frame_{frame_idx:06d}.png")
-    cv2.imwrite(out_path, mask_vis)
+    cv2.imwrite(out_path, out)
 
 
 def build_palette(num_classes: int) -> np.ndarray:
@@ -174,13 +231,14 @@ def build_palette(num_classes: int) -> np.ndarray:
 def render_segmentation(mask: np.ndarray):
     if mask is None:
         return None
-    mask = to_numpy_mask(mask)
-    if mask.ndim == 3 and mask.shape[2] > 1:
-        labels = np.argmax(mask, axis=2).astype(np.uint8)
-        palette = build_palette(CFG.num_classes)
-        return palette[labels]
-    mask_single = np.squeeze(mask)
-    mask_bin = (mask_single >= 0.5).astype(np.uint8) * 255
+    num_classes = int(getattr(CFG, "num_classes", 1))
+    labels = _mask_to_labels(mask, num_classes)
+    if labels is None:
+        return None
+    if num_classes > 2:
+        return _labels_to_color(labels, num_classes)
+    # binary visualization
+    mask_bin = (labels.astype(np.uint8) * 255)
     return cv2.applyColorMap(mask_bin, cv2.COLORMAP_TURBO)
 
 
@@ -190,16 +248,18 @@ def overlay_mask(frame: np.ndarray, mask: np.ndarray, alpha: float = 0.5) -> np.
         return None
     if mask is None:
         return frame
-    mask = to_numpy_mask(mask)
-    mask_bin = np.squeeze(mask)
-    mask_bin = (mask_bin >= 0.5).astype(np.uint8)
-    if mask_bin.ndim == 3 and mask_bin.shape[2] > 1:
-        mask_bin = np.argmax(mask_bin, axis=2).astype(np.uint8)
-    mask_bin = cv2.resize(mask_bin, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-    green = np.zeros_like(frame)
-    green[..., 1] = 255
-    color = frame * (1 - mask_bin[..., None]) + green * mask_bin[..., None]
-    blended = cv2.addWeighted(color.astype(np.uint8), alpha, frame, 1.0 - alpha, 0)
+    num_classes = int(getattr(CFG, "num_classes", 1))
+    labels = _mask_to_labels(mask, num_classes)
+    if labels is None:
+        return frame
+    labels = cv2.resize(labels, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+    if num_classes > 2:
+        color = _labels_to_color(labels, num_classes)  # RGB
+        # frame is assumed RGB in this script
+        blended = cv2.addWeighted(color.astype(np.uint8), alpha, frame, 1.0 - alpha, 0)
+    else:
+        color = cv2.applyColorMap((labels.astype(np.uint8) * 255), cv2.COLORMAP_TURBO)
+        blended = cv2.addWeighted(color.astype(np.uint8), alpha, frame, 1.0 - alpha, 0)
     return blended
 
 
@@ -239,6 +299,8 @@ def build_debug_panel(labeled_images, frame_shape):
 # --- Debug video writer (for saving panels as a video) ---
 DEBUG_VIDEO_WRITER = None
 DEBUG_VIDEO_PATH = None
+DEBUG_VIDEO_FRAME_SIZE_WH = None
+DEBUG_VIDEO_FRAMES_WRITTEN = 0
 
 def _init_debug_video_writer(frame_size_wh, fps: float):
     ensure_dir(CFG.debug_dir)
@@ -253,26 +315,40 @@ def _init_debug_video_writer(frame_size_wh, fps: float):
     safe_fps = float(fps if fps and fps > 0 else 30.0)
     DEBUG_VIDEO_WRITER = cv2.VideoWriter(path, fourcc, safe_fps, frame_size_wh, True)
     DEBUG_VIDEO_PATH = path
+    if not DEBUG_VIDEO_WRITER.isOpened():
+        # Fail fast: otherwise you'll end up with a tiny/unplayable mp4.
+        raise RuntimeError(
+            f"cv2.VideoWriter failed to open: path={path}, size={frame_size_wh}, fps={safe_fps}, fourcc='mp4v'"
+        )
 
 def close_debug_video():
-    global DEBUG_VIDEO_WRITER
+    global DEBUG_VIDEO_WRITER, DEBUG_VIDEO_FRAME_SIZE_WH
     if DEBUG_VIDEO_WRITER is not None:
         DEBUG_VIDEO_WRITER.release()
         DEBUG_VIDEO_WRITER = None
+    DEBUG_VIDEO_FRAME_SIZE_WH = None
 
 def save_debug_panel(panel: np.ndarray, frame_idx: int):
     # Save debug panel into a video instead of per-frame images
     if panel is None:
         return
-    global DEBUG_VIDEO_WRITER
+    global DEBUG_VIDEO_WRITER, DEBUG_VIDEO_FRAME_SIZE_WH, DEBUG_VIDEO_FRAMES_WRITTEN
     if DEBUG_VIDEO_WRITER is None:
         # Initialize writer on first use with current panel size and video FPS
         fps = float(getattr(CFG, "debug_video_fps", 30.0))
         h, w = panel.shape[:2]
-        _init_debug_video_writer((w, h), fps)
+        DEBUG_VIDEO_FRAME_SIZE_WH = (int(w), int(h))
+        _init_debug_video_writer(DEBUG_VIDEO_FRAME_SIZE_WH, fps)
+        DEBUG_VIDEO_FRAMES_WRITTEN = 0
     # Ensure panel is 3-channel uint8
     #panel = cv2.cvtColor(panel, cv2.COLOR_BGR2RGB)
+    # OpenCV's VideoWriter requires consistent frame size; enforce it.
+    if DEBUG_VIDEO_FRAME_SIZE_WH is not None:
+        w0, h0 = DEBUG_VIDEO_FRAME_SIZE_WH
+        if panel.shape[1] != w0 or panel.shape[0] != h0:
+            panel = cv2.resize(panel, (w0, h0), interpolation=cv2.INTER_LINEAR)
     DEBUG_VIDEO_WRITER.write(panel)
+    DEBUG_VIDEO_FRAMES_WRITTEN += 1
 
 
 def main():
@@ -280,7 +356,7 @@ def main():
     if CFG.debug:
         ensure_dir(CFG.debug_dir)
     seg_model = CanvasSegModel(CFG)
-    inferencer = StitchInferencer(seg_model, start_frame=CFG.start_frame, cfg=CFG)
+    inferencer = StitchInferencer(seg_model, start_frame=CFG.start_frame, cfg=CFG, canvas_channels=CFG.num_classes)
 
     cap = cv2.VideoCapture(CFG.video_path)
     if not cap.isOpened():
@@ -304,29 +380,33 @@ def main():
     pbar = tqdm(total=total_frames, desc="Stitch+Seg")
     profiler = cProfile.Profile()
 
-    while True:
-        if end_frame is not None and frame_idx > end_frame:
-            break
-        t0 = time.time()
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frame_u = inferencer.preprocess_frame(frame)
-        profiler.enable()
-        inferencer.step_canvas(frame_u) # 4-6s
-        if (frame_idx - CFG.start_frame) % stride == 0:
-            seg_map = inferencer.model_inference(frame_u.shape[-2:]) # 0.02s
+    try:
+        while True:
+            if end_frame is not None and frame_idx > end_frame:
+                break
+            t0 = time.time()
+            ok, frame = cap.read()
+            if not ok:
+                break
+            #inferencer.ellipse_mask = None
+            frame_u = inferencer.preprocess_frame(frame)
+            profiler.enable()
+            direct_seg, direct_input = seg_model.predict_on_frame(frame_u)
+            stitched_seg = inferencer.step_prediction(frame_u, direct_seg, transform="tps")
             profiler.disable()
-            if seg_map is not None:
+            if (frame_idx - CFG.start_frame) % stride == 0:
                 if CFG.debug:
-                    direct_seg, direct_input = seg_model.predict_on_frame(frame_u)
                     frame_vis = to_numpy_image(frame_u)
-                    overlay_stitched = overlay_mask(frame_vis, seg_map)
+                    overlay_stitched = overlay_mask(frame_vis, stitched_seg)
                     overlay_direct = overlay_mask(frame_vis, direct_seg)
-                    canvas_vis = inferencer.canvas
-                    canvas_vis = to_numpy_image(canvas_vis)
-                    if canvas_vis is not None and frame_vis is not None and canvas_vis.shape[:2] != frame_vis.shape[:2]:
-                        canvas_vis = cv2.resize(canvas_vis, (frame_vis.shape[1], frame_vis.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    # `inferencer.canvas` is often multi-channel (e.g., num_classes logits).
+                    # Visualize it safely as an RGB image.
+                    canvas_vis = render_segmentation(inferencer.canvas)
+                    if canvas_vis is not None and frame_vis is not None:
+                        if canvas_vis.shape[:2] != frame_vis.shape[:2]:
+                            canvas_vis = cv2.resize(
+                                canvas_vis, (frame_vis.shape[1], frame_vis.shape[0]), interpolation=cv2.INTER_LINEAR
+                            )
                     model_input = inferencer.last_model_input if inferencer.last_model_input is not None else seg_model.last_model_input_image
                     model_output = inferencer.last_model_output if inferencer.last_model_output is not None else seg_model.last_model_output
                     # model_output is a probability/logit-like map; don't convert it to an 8-bit image
@@ -341,7 +421,7 @@ def main():
                             ("model_input", model_input),
                             ("seg - stitched", overlay_stitched),
                             ("seg - original", overlay_direct),
-                            ('merge_mask',  inferencer.combined_mask_prev_raw.squeeze(0).squeeze(0).cpu().detach().numpy()),
+                            ('merge_mask',  inferencer.canvas4model_mask.squeeze(0).squeeze(0).cpu().detach().numpy()),
                         ],
                         frame_vis.shape[:2] if frame_vis is not None else frame.shape[:2],
                     )
@@ -350,19 +430,20 @@ def main():
                 else:
                     #save_segmentation(seg_map, frame_idx)
                     pass
-        frame_idx += 1
-        pbar.update(1)
-
-    pbar.close()
-    
-    stats = pstats.Stats(profiler)
-    stats.strip_dirs()
-    stats.sort_stats('cumtime')
-    stats.print_stats(20)
-
-    cap.release()
-    # Close debug video if used
-    close_debug_video()
+            frame_idx += 1
+            pbar.update(1)
+    finally:
+        pbar.close()
+        stats = pstats.Stats(profiler)
+        stats.strip_dirs()
+        stats.sort_stats('cumtime')
+        stats.print_stats(20)
+        cap.release()
+        # Close debug video if used
+        close_debug_video()
+        if CFG.debug:
+            global DEBUG_VIDEO_PATH, DEBUG_VIDEO_FRAMES_WRITTEN
+            print(f"[debug_video] path={DEBUG_VIDEO_PATH} frames_written={DEBUG_VIDEO_FRAMES_WRITTEN}")
 
 
 if __name__ == "__main__":

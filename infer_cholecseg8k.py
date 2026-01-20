@@ -14,8 +14,8 @@ import segmentation_models_pytorch as smp
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from stitch_seg import StitchInferencerDev as StitchInferencer
-#from stitch_seg import StitchInferencer
+#from stitch_seg import StitchInferencerDev as StitchInferencer
+from stitch_seg import StitchInferencer
 import time
 import cProfile
 import pstats
@@ -31,7 +31,7 @@ class CFG:
     enable_depth_mask = False
     output_dir = "0114_check"
     method = "pyramid"
-    bbox_mode = "external"
+    bbox_mode = "internal"
     apply_ellipse_mask = True
     laplacian_var_min = 60
     segmentation_weights = "weights/fold0.pth"
@@ -45,7 +45,7 @@ class CFG:
 
     debug = True
     debug_dir = "0114_check"
-    debug_video_filename = "external.mp4"
+    debug_video_filename = "internal.mp4"
 
 class CanvasSegModel(nn.Module):
     def __init__(self, cfg):
@@ -374,7 +374,7 @@ def main():
         #inferencer.ellipse_mask = None
         frame_u = inferencer.preprocess_frame(frame)
         profiler.enable()
-        inferencer.step_canvas(frame_u) # 4-6s
+        inferencer.step_canvas(frame_u, transform="tps") # 4-6s
         if (frame_idx - CFG.start_frame) % stride == 0:
             seg_map = inferencer.model_inference(frame_u.shape[-2:]) # 0.02s
             profiler.disable()
