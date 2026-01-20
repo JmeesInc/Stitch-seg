@@ -51,12 +51,13 @@ class StitchInferencer(nn.Module):
          into the current frame space.
     """
 
-    def __init__(self, model, start_frame: int, cfg=None):
+    def __init__(self, model, start_frame: int, cfg=None, canvas_channels=3):
         super().__init__()
         if cfg is None:
             cfg = build_default_cfg()
         else:
             cfg = apply_stitch_defaults(cfg)
+        self.canvas_channels = canvas_channels
         self.model = model
         self.cfg = cfg
         self.start_frame = int(start_frame)
