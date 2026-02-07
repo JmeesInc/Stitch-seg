@@ -1,7 +1,7 @@
 """Run segmentation on a stitched canvas using StitchInferencer."""
 import os
 os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 from typing import Optional
 
 import albumentations as A
@@ -40,7 +40,7 @@ class CFG:
     # For binary segmentation (num_classes=1), set this to None to avoid overwriting the only channel.
     tool_class_ch = None
 
-    debug = True
+    debug = False
     debug_dir = "0114_check"
     debug_video_filename = "internal.mp4"
 

@@ -21,19 +21,16 @@ from .stitch_utils_torch import (
     equalize_hist_rgb,
     compute_depth_mask,
     merge_masks,
-    translation_matrix_from_shift,
     warp_with_transform,
     filter_features_by_mask,
-    paste_current_to_canvas_forward,paste_current_to_canvas_forward_poisson,paste_current_to_canvas_forward_multiband,
-    invert_canvas_valid_mask,
-    extract_canvas_features,
-    convert_homography_to_raw_space,
+    paste_current_to_canvas_forward,
+    paste_current_to_canvas_forward_poisson,
+    paste_current_to_canvas_forward_multiband,
     translation_matrix_from_offset,
     shear_angle_from_homography,
     rotate_angle_from_homography,
     scale_factor_from_homography,
     reset_canvas_orientation,
-    get_tool_class_ids,
     laplacian_var
 )
 
@@ -637,17 +634,16 @@ class StitchInferencer(nn.Module):
             if reset:
                 H_cum_curr = H_cum_curr.to(torch.float32)
                 old_offset_xy = self.offset_xy
-                self.canvas, self.canvas_mask, new_offset_xy = reset_canvas_orientation(
+                self.canvas, self.canvas_mask = reset_canvas_orientation(
                     self.canvas, self.canvas_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, old_offset_xy
                 )
                 # Keep `canvas4model` in the SAME coordinate system after reset.
                 # Otherwise, `model_inference()` (which reads `canvas4model`) will be misaligned
                 # with `offset_xy`/`H_cum` (which are reset here).
                 if self.canvas4model is not None and self.canvas4model_mask is not None:
-                    self.canvas4model, self.canvas4model_mask, _ = reset_canvas_orientation(
+                    self.canvas4model, self.canvas4model_mask = reset_canvas_orientation(
                         self.canvas4model, self.canvas4model_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, old_offset_xy
                     )
-                self.offset_xy = new_offset_xy
                 self.H_cum = torch.eye(3, device=self.device)
             #self.canvas = self.canvas4model.clone()
             #self.canvas_mask = self.canvas4model_mask.clone()
@@ -1005,17 +1001,16 @@ class StitchInferencer(nn.Module):
             if reset:
                 H_cum_curr = H_cum_curr.to(torch.float32)
                 old_offset_xy = self.offset_xy
-                self.canvas, self.canvas_mask, new_offset_xy = reset_canvas_orientation(
+                self.canvas, self.canvas_mask = reset_canvas_orientation(
                     self.canvas, self.canvas_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, old_offset_xy
                 )
                 # Keep `canvas4model` in the SAME coordinate system after reset.
                 # Otherwise, `model_inference()` (which reads `canvas4model`) will be misaligned
                 # with `offset_xy`/`H_cum` (which are reset here).
                 if self.canvas4model is not None and self.canvas4model_mask is not None:
-                    self.canvas4model, self.canvas4model_mask, _ = reset_canvas_orientation(
+                    self.canvas4model, self.canvas4model_mask = reset_canvas_orientation(
                         self.canvas4model, self.canvas4model_mask, H_cum_curr, frame_u.shape[-2:], self.cfg, old_offset_xy
                     )
-                self.offset_xy = new_offset_xy
                 self.H_cum = torch.eye(3, device=self.device)
             #self.canvas = self.canvas4model.clone()
             #self.canvas_mask = self.canvas4model_mask.clone()

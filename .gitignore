@@ -15,3 +15,5 @@ cjec
 .venv
 
 *.mp4
+*.onnx
+CLAUDE.md

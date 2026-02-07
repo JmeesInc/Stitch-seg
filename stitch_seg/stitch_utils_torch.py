@@ -10,7 +10,6 @@ Assumption:
 import torch
 import torch.nn.functional as F
 import kornia
-import numpy as np # Used only for minimal logic (e.g. palette generation lists) if strictly needed, mostly avoided.
 import matplotlib.pyplot as plt
 # -----------------------------------------------------------------------------
 # 1. ROI & Preprocessing
@@ -304,104 +303,6 @@ def _build_tps_grid(output_shape, input_shape, kernel_centers, kernel_weights, a
     warped = warped.view(batch_size, out_h, out_w, 2)
     grid_norm = kornia.geometry.normalize_pixel_coordinates(warped, in_h, in_w)
     return grid_norm
-
-
-def compute_optical_flow_mask(flow_tensor: torch.Tensor, base_mask: torch.Tensor, cfg):
-    """
-    Calculates statistics and motion mask from a PRE-CALCULATED flow tensor.
-    
-    Arguments:
-        flow_tensor: (B, 2, H, W) torch.Tensor (Previously calculated by NeuFlow/Raft)
-                     This replaces (prev_gray, curr_gray) inputs.
-        base_mask: (H, W) or (B, 1, H, W)
-    """
-    stats = {
-        "valid_ratio": 0.0,
-        "motion_ratio": 1.0,
-        "shift": (0.0, 0.0),
-        "shift_mag": float("inf"),
-        "med_res": 0.0,
-        "res_thresh": 0.0,
-        "med_mag": 0.0,
-        "mag_thresh": 0.0,
-    }
-
-    if flow_tensor is None:
-        # Return dummy assuming shape
-        return None, (0.0, 0.0), None, stats
-
-    # Dimensions
-    B, _, H, W = flow_tensor.shape
-    device = flow_tensor.device
-    
-    dx = flow_tensor[:, 0, ...]
-    dy = flow_tensor[:, 1, ...]
-    mag = torch.sqrt(dx**2 + dy**2)
-
-    # Base Mask Handling
-    if base_mask is not None:
-        if base_mask.dim() == 2:
-            base_mask = base_mask.unsqueeze(0) # (1, H, W)
-        # Assuming base_mask 0 is valid
-        valid_mask = (base_mask == 0)
-    else:
-        valid_mask = torch.ones((B, H, W), dtype=torch.bool, device=device)
-
-    valid_mask &= torch.isfinite(dx) & torch.isfinite(dy)
-    
-    valid_count = valid_mask.sum().item()
-    total_pixels = valid_mask.numel()
-    
-    stats["valid_ratio"] = valid_count / total_pixels if total_pixels > 0 else 0.0
-    
-    if stats["valid_ratio"] < cfg.optflow_min_valid_ratio:
-        return torch.zeros((H, W), dtype=torch.uint8, device=device), (0.0, 0.0), flow_tensor, stats
-
-    # Extract valid values (Flattened)
-    dx_valid = dx[valid_mask]
-    dy_valid = dy[valid_mask]
-    
-    med_dx = dx_valid.median()
-    med_dy = dy_valid.median()
-    
-    # Residuals
-    residual = torch.sqrt((dx - med_dx)**2 + (dy - med_dy)**2)
-    residual_valid = residual[valid_mask]
-    mag_valid = mag[valid_mask]
-    
-    med_res = residual_valid.median()
-    mad_res = (residual_valid - med_res).abs().median() + 1e-6
-    res_thresh = med_res + cfg.optflow_residual_factor * mad_res
-    
-    med_mag = mag_valid.median()
-    mad_mag = (mag_valid - med_mag).abs().median() + 1e-6
-    mag_thresh = med_mag + cfg.optflow_magnitude_factor * mad_mag
-    
-    # Motion Mask Construction
-    raw_mask = (residual > res_thresh) | (mag > mag_thresh) # (B, H, W)
-    
-    # Morphology (Close -> Open)
-    kernel = torch.ones(5, 5, device=device)
-    m_float = raw_mask.float().unsqueeze(1) # (B, 1, H, W)
-    m_closed = kornia.morphology.closing(m_float, kernel)
-    m_opened = kornia.morphology.opening(m_closed, kernel)
-    
-    motion_mask = (m_opened > 0.5).squeeze(1).to(torch.uint8) * 255
-    motion_ratio = (motion_mask > 0).float().mean().item()
-    
-    shift = (med_dx.item(), med_dy.item())
-    
-    stats.update({
-        "motion_ratio": motion_ratio,
-        "shift": shift,
-        "shift_mag": float(np.hypot(shift[0], shift[1])),
-        "med_res": med_res.item(),
-        "res_thresh": res_thresh.item(),
-        "med_mag": med_mag.item(),
-        "mag_thresh": mag_thresh.item(),
-    })
-    
-    return motion_mask.squeeze(0), shift, flow_tensor, stats
 
 
 def filter_features_by_mask(feats: dict, invalid_mask: torch.Tensor) -> dict:
@@ -791,33 +692,12 @@ def reset_canvas_orientation(canvas: torch.Tensor, canvas_mask: torch.Tensor, H_
     
     # 1. Old Transform (Current -> Old Canvas)
     # P_old = S @ T_old
-    T_old = translation_matrix_from_offset(old_offset_xy, device=device)
-    P_old = S @ T_old
+    T = translation_matrix_from_offset(old_offset_xy, device=device)
+    P_old = S @ T
     
     # H_total_old = P_old @ H_to_canvas
     H_total_old = P_old @ H_to_canvas
-    
-    # 2. New Transform (Current -> New Canvas, Rotation Removed)
-    # New offset should be based on unscaled canvas size to work with S @ T
-    frame_h, frame_w = frame_shape[-2:]
-    
-    base_cw = int(cw / scale) if scale > 0 else cw
-    base_ch = int(ch / scale) if scale > 0 else ch
-    
-    offset_x = base_cw // 2 - frame_w // 2
-    offset_y = base_ch // 2 - frame_h // 2
-    
-    T_new = translation_matrix_from_offset((offset_x, offset_y), device=device)
-    P_new = S @ T_new
-    
-    # H_total_new = P_new (since H_to_canvas is reset to Identity)
-    
-    # 3. Warp Matrix M (Old Canvas -> New Canvas)
-    # x_old = H_total_old @ x_curr
-    # x_new = P_new @ x_curr
-    # x_curr = inv(H_total_old) @ x_old
-    # x_new = P_new @ inv(H_total_old) @ x_old
-    
+    P_new = S @ T
     try:
         H_old_inv = torch.linalg.inv(H_total_old)
     except RuntimeError:
@@ -838,7 +718,7 @@ def reset_canvas_orientation(canvas: torch.Tensor, canvas_mask: torch.Tensor, H_
     warped_mask = warped_packed[:, canvas_chs:canvas_chs + mask_chs]
     warped_mask = (warped_mask > 0).to(torch.uint8) * 255
     
-    return warped_canvas, warped_mask, (offset_x, offset_y)
+    return warped_canvas, warped_mask
 
 
 def estimate_camera_shift(flow_tensor: torch.Tensor, base_mask: torch.Tensor, cfg):
@@ -1149,10 +1029,6 @@ def paste_current_to_canvas_forward_poisson(
     canvas_mask[wm_bool] = 255
     canvas4model_mask[wm4_bool] = 255
     return canvas, canvas_mask, canvas4model, canvas4model_mask
-# Helper (依存関係維持)
-def translation_matrix_from_offset(offset_xy, device):
-    tx, ty = offset_xy[0], offset_xy[1]
-    return torch.tensor([[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
 
 def build_gaussian_pyramid(tensor, levels=5):
     pyramid = [tensor]
@@ -1183,10 +1059,6 @@ def reconstruct_from_laplacian(laplacian_pyramid):
             up_current = F.interpolate(up_current, size=h_next.shape[-2:], mode='nearest')
         current = h_next + up_current
     return current
-
-def translation_matrix_from_offset(offset_xy, device):
-    tx, ty = offset_xy[0], offset_xy[1]
-    return torch.tensor([[1.0, 0.0, tx], [0.0, 1.0, ty], [0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
 
 # --- Main Function with Mask Softening ---
 def paste_current_to_canvas_forward_multiband(
@@ -1258,23 +1130,9 @@ def paste_current_to_canvas_forward_multiband(
 
     c_img = img_to_warp.shape[1]
     packed = torch.cat([img_to_warp.float(), mask_b, mask4model_b, rm_b], dim=1)  # (1, C+3, H, W)
-    if use_tps:
-        kernel_centers, kernel_weights, affine_weights = tps_params
-        kernel_centers = kernel_centers.to(torch.float32)
-        kernel_weights = kernel_weights.to(torch.float32)
-        affine_weights = affine_weights.to(torch.float32)
-        tps_grid = _build_tps_grid((ch, cw), current_img.shape[-2:], kernel_centers, kernel_weights, affine_weights)
-        warped_packed = F.grid_sample(
-            packed.float(),
-            tps_grid,
-            mode='nearest',
-            padding_mode='zeros',
-            align_corners=True,
-        )
-    else:
-        warped_packed = kornia.geometry.transform.warp_perspective(
-            packed, (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
-        )
+    warped_packed = kornia.geometry.transform.warp_perspective(
+        packed, (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
+    )
     warped = warped_packed[:, :c_img].to(canvas.dtype)
     warped_mask = warped_packed[:, c_img:c_img + 1]
     warped_mask4model = warped_packed[:, c_img + 1:c_img + 2]
@@ -1318,13 +1176,15 @@ def paste_current_to_canvas_forward_multiband(
         # Optimization: ROI Clipping
         rows, cols = torch.where(valid_new_region.squeeze(0).squeeze(0))
         if len(rows) > 0:
-            y_min, y_max = rows.min().item(), rows.max().item() + 1
-            x_min, x_max = cols.min().item(), cols.max().item() + 1
+            y_min, y_max = rows.min(), rows.max()+ 1
+            x_min, x_max = cols.min(), cols.max() + 1
             
             # ROI Padding
             pad = 2 ** levels
-            y_min = int(max(0, y_min - pad)); x_min = int(max(0, x_min - pad))
-            y_max = int(min(ch, y_max + pad)); x_max = int(min(cw, x_max + pad))
+            y_min = torch.clamp(y_min - pad, min=0).to(torch.int32)
+            x_min = torch.clamp(x_min - pad, min=0).to(torch.int32)
+            y_max = torch.clamp(y_max + pad, max=ch).to(torch.int32)
+            x_max = torch.clamp(x_max + pad, max=cw).to(torch.int32)
             
             # Crop ROI
             roi_canvas = canvas[..., y_min:y_max, x_min:x_max].float()
@@ -1489,3 +1349,4 @@ def paste_current_to_canvas_tps(
         update_mode=update_mode,
         tps_params=tps_params,
     )
+

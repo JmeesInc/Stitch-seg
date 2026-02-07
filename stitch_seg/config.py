@@ -2,13 +2,14 @@ import torch
 
 
 DEFAULT_CFG_VALUES = {
-    "enable_depth_mask": True,
+    "tool_class_ch": 0,
+    "enable_depth_mask": False,
     "enable_flow_translation": False,
     "enable_motion_mask": False,
     "equalize_hist_rgb": False,
     "stride": 1,
     "method": "pyramid",#feature, pyramid, poisson
-    "canvas_superres_scale": 1,
+    "canvas_superres_scale": 1.0,
     "canvas_scale_x": 3,
     "canvas_scale_y": 3,
     "alpha_overlap": 0.95,
@@ -30,7 +31,7 @@ DEFAULT_CFG_VALUES = {
     "aliked_model": "aliked-n16",
     "aliked_weights": "weights/aliked-n16.pth",
     "lightglue_weights": "weights/aliked_lightglue_v0-1_arxiv.pth",
-    "port_detector_weights": "weights/convnext_base-unet-cholec80_port.pt",
+    "port_detector_weights": "weights/convnext_tiny-unet-cholec80_port.pt",
     "checkpoint_dir": "checkpoint",
     "feature_detection_threshold": 0.2,
     "feature_nms_radius": 2,

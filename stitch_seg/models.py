@@ -27,27 +27,27 @@ def init_feature_pipeline(cfg):
 
 def load_masking_model(cfg):
     seg_model = smp.Unet(
-        encoder_name="tu-convnext_base.dinov3_lvd1689m",
+        encoder_name="tu-convnext_tiny.dinov3_lvd1689m",
         encoder_weights="imagenet",
         in_channels=3,
         classes=1,
         activation="sigmoid",
     ).to(cfg.device)
-    ckpt_path = getattr(cfg, "tool_detector_weights", "weights/convnext-unet-best.pth")
-    state = torch.load(ckpt_path, map_location=cfg.device)["model_state_dict"]
+    ckpt_path = getattr(cfg, "tool_detector_weights", "weights/convnext_tiny-unet-best.pt")
+    state = torch.load(ckpt_path, map_location=cfg.device)
     seg_model.load_state_dict(state, strict=True)
     seg_model.eval()
     return seg_model
 
 def load_masking_model2(cfg):
     seg_model = smp.Unet(
-        encoder_name="tu-convnext_base",
+        encoder_name="tu-convnext_tiny",
         encoder_weights="imagenet",
         in_channels=3,
         classes=1,
         activation="sigmoid",
     ).to(cfg.device)
-    ckpt_path = getattr(cfg, "port_detector_weights", "weights/convnext_base-unet-cholec80_port.pt")
+    ckpt_path = getattr(cfg, "port_detector_weights", "weights/convnext_tiny-unet-cholec80_port.pt")
     state = torch.load(ckpt_path, map_location=cfg.device)
     seg_model.load_state_dict(state, strict=True)
     seg_model.eval()
