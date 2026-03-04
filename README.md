@@ -6,11 +6,27 @@ An experimental project for **stitching a temporal sequence of frames into a can
 
 ---
 
+## Usage
+### Use as a library (minimal example)
+
+```python
+from stitch_seg import StitchInferencer
+import torch
+
+seg_model = MySegModel().cuda().eval() # Assume input is 0~255 tensor, please define preprocess pipeline at MySegmodel.forward()
+infer = StitchInferencer(model=seg_model)
+
+frame_t = torch.zeros(1, 3, 480, 854, device="cuda")  # (1, 3, H, W) float
+infer.step_canvas(frame_t)
+pred = infer.model_inference(frame_shape=(480, 854))   # (C, H, W)
+```
+
+---
+
 ## Features
 
 - **Canvas stitching**: sequentially paste frames onto a canvas while tracking cumulative transforms
 - **Tool masking**: generate a tool mask using a pre-trained tool detector to suppress invalid regions
-- **(Optional) depth masking**: when `enable_depth_mask=True`, build a depth-based mask (Depth Anything–style)
 - **Segmentation on canvas**: crop the canvas region relevant to the current frame and run the segmentation model
 - **Warp back to frame**: return the prediction warped to the current frame as `(C, H, W)`
 
@@ -18,9 +34,51 @@ An experimental project for **stitching a temporal sequence of frames into a can
 
 ## Requirements
 
-- **Python**: `>= 3.9`
-- **PyTorch / CUDA**: GPU is recommended (this repo also includes a `uv` index for CUDA wheels in `pyproject.toml`)
-- **Key deps**: `kornia`, `ptlflow`, `segmentation-models-pytorch`, `opencv-python`, etc. (see `pyproject.toml`)
+- **Python**: `>= 3.9, <= 3.13`
+- **PyTorch**: CUDA 12.6 wheels (configured via `uv` in `pyproject.toml`)
+- **TensorRT**: `>= 10.15` (included in the DevContainer; required for TRT engine export and inference)
+- **NVIDIA Driver**: CUDA driver API version **13.0** or later is required (corresponds to NVIDIA Display Driver **≥ 570**). Older drivers will fail to load the TensorRT container or run CUDA 12.x kernels.
+
+---
+
+## DevContainer Setup
+
+A `.devcontainer` configuration is provided for VS Code / GitHub Codespaces.
+
+**Base image**: `nvcr.io/nvidia/tensorrt:26.01-py3`
+(TensorRT 10.x, Python 3.12, CUDA 12.8)
+
+**Prerequisites on the host machine**:
+- NVIDIA Driver ≥ 570 (CUDA driver API 13.0)
+
+**Steps**:
+
+1. Clone the repository:
+
+```bash
+git clone <repo-url> stitch_seg_dev
+cd stitch_seg_dev
+```
+
+2. Open the folder in VS Code and select **"Reopen in Container"**, or run:
+
+```bash
+devcontainer up --workspace-folder .
+```
+
+The container starts with `--gpus=all --net=host --ipc=host` so GPU and host networking are available.
+
+3. Inside the container, install Python dependencies:
+
+```bash
+uv sync
+```
+
+4. Verify GPU access:
+
+```bash
+python -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)"
+```
 
 ---
 
@@ -31,87 +89,174 @@ An experimental project for **stitching a temporal sequence of frames into a can
 This repository includes `uv.lock` for reproducible environments.
 
 ```bash
-cd /path/to/stitch_seg
+uv venv
 uv sync
 ```
-
-### pip (development / editable)
-
-```bash
-cd /path/to/stitch_seg
-python3 -m pip install -e .
-```
-
-Notes:
-- Installing a CUDA-enabled PyTorch build is environment-specific. Follow your platform/team guidance.
 
 ---
 
 ## Weights
-
+Please downloads model weights from release.
 By default, the code expects these relative paths (from the repository root):
 
 - **ALIKED**: `weights/aliked-n16.pth` (`cfg.aliked_weights`)
 - **LightGlue**: `weights/aliked_lightglue_v0-1_arxiv.pth` (`cfg.lightglue_weights`)
-- **Tool detector (U-Net)**: `weights/convnext-unet-best.pth` (`cfg.tool_detector_weights`, default if unset)
+- **Tool detector**: `weights/convnext_tiny-unet-best.pt` (`cfg.tool_detector_weights`)
+- **Port detector**: `weights/convnext_tiny-unet-cholec80_port.pt` (`cfg.port_detector_weights`)
 
-Notes:
-- If you run from a different working directory, relative paths may break. For production/use in notebooks, prefer **absolute paths** in `cfg.*_weights`.
-- For depth masking, set `cfg.enable_depth_mask=True` and provide a valid checkpoint path via `cfg.depth_anything_v2_model` (the default in `stitch_seg/config.py` points outside this repo).
+For production, prefer **absolute paths** in `cfg.*_weights`.
 
 ---
 
-## Usage
 
-### 1) Run the example script (`main.py`)
+## Speed Benchmark Reproduction
 
-`main.py` is an example runner. Edit the following fields in `CFG` to match your environment:
+All benchmark scripts live in `exp/` and are run as Python modules from the repository root. Three pipeline variants are supported.
 
-- `CFG.video_path`
-- `CFG.start_frame`, `CFG.end_frame`
-- `CFG.segmentation_weights` (your segmentation model checkpoint)
-- `CFG.output_dir`
+> **Note**: `VIDEO.mp4` should be replaced with the path to your input video. Benchmarks measure per-frame inference latency (ONNX CUDA EP, IOBinding) and report FPS, mean/p95/p99 latency, and save results to a JSON file.
 
-Run:
+---
+
+### Variant 1: Stitch-only
+
+Exports and benchmarks only the canvas stitching pipeline (ALIKED + LightGlue + homography + canvas blend), without segmentation.
+
+**Step 1 — Export to ONNX**
 
 ```bash
-python3 main.py
+python exp/export_onnx_only.py \
+    --out onnx_only/only.onnx \
+    --height 480 --width 854
 ```
 
-### 2) Use as a library (minimal example)
+This produces `onnx_only/only.onnx` (step model) and `onnx_only/only_init.onnx` (first-frame model). FP16 variants (`.fp16.onnx`) are also written automatically.
 
-`StitchInferencer` handles stitching + coordinate transforms and expects a segmentation model callable as `model(crop)` where `crop` is `(B, 3, H, W)`.
+**Step 2 — (Optional) Export to TensorRT engine**
 
-```python
-import numpy as np
-import torch
+```bash
+python exp/export_trt_only.py \
+    --onnx-step onnx_only/only.onnx \
+    --out-dir trt_engine_only \
+    --fp16
+```
 
-from stitch_seg import StitchInferencer
+**Step 3 — Benchmark**
 
+```bash
+# FP32
+python exp/bench_onnx_only.py \
+    --onnx-step onnx_only/only.onnx \
+    --video VIDEO.mp4 \
+    --start 100 --end 1000 --warmup 100 \
+    --name results/stitch_only_fp32.json
 
-class MySeg(torch.nn.Module):
-    def forward(self, x):  # x: (B, 3, H, W)
-        # Normalize + infer here, return (B, C, H, W)
-        return torch.zeros((x.shape[0], 1, x.shape[2], x.shape[3]), device=x.device)
+# FP16
+python exp/bench_onnx_only.py \
+    --onnx-step onnx_only/only.onnx \
+    --video VIDEO.mp4 \
+    --start 100 --end 1000 --warmup 100 \
+    --fp16 \
+    --name results/stitch_only_fp16.json
+```
 
+---
 
-seg_model = MySeg().cuda().eval()
+### Variant 2: Segmentation-only (frame-by-frame baseline)
 
-# cfg can be any object with attributes (if None, defaults are applied)
-infer = StitchInferencer(model=seg_model, start_frame=0, cfg=None)
+Exports and benchmarks only the segmentation model (no stitching), to measure pure segmentation throughput.
 
-# frame_rgb is assumed to be (H, W, 3) uint8 in RGB
-frame_rgb = np.zeros((480, 640, 3), dtype=np.uint8)
-frame_u = (
-    torch.from_numpy(frame_rgb)
-    .permute(2, 0, 1)
-    .unsqueeze(0)
-    .to(infer.device)
-    .float()
-)
+**Step 1 — Export to ONNX**
+Please prepare your trained segmentation model and weights and replace with the model in exp/export_onnx_seg.py. Or you can prepare segmentation models with following exp/cholecseg8k_benchmark/README.md
+```bash
+python exp/export_onnx_seg.py \
+    --out onnx_seg/seg.onnx \
+    --height 480 --width 854 \
+    --num-classes 13 \
+    --seg-weights models/unetpp/fold0.pth \
+    --fp16
+```
 
-infer.step_canvas(frame_u)
-pred = infer.model_inference(frame_shape=frame_rgb.shape[:2])  # (C, H, W)
+**Step 2 — Benchmark**
+
+```bash
+# FP32
+python exp/bench_onnx_seg.py \
+    --onnx-file onnx_seg/seg.onnx \
+    --video VIDEO.mp4 \
+    --start 100 --end 1000 --warmup 100 \
+    --name results/seg_fp32.json
+
+# FP16
+python exp/bench_onnx_seg.py \
+    --onnx-file onnx_seg/seg.onnx \
+    --video VIDEO.mp4 \
+    --start 100 --end 1000 --warmup 100 \
+    --fp16 \
+    --name results/seg_fp16.json
+```
+
+---
+
+### Variant 3: Stitch + Segmentation (full pipeline)
+
+Exports and benchmarks the full pipeline: canvas stitching + segmentation inference.
+
+**Step 1 — Export to ONNX**
+
+```bash
+python exp/export_onnx.py \
+    --out onnx_stitch/stitch.onnx \
+    --height 480 --width 854 \
+    --num-classes 13 \
+    --seg-weights models/unetpp/fold0.pth \
+    --tool-weights weights/convnext_tiny-unet-best.pt \
+    --port-weights weights/convnext_tiny-unet-cholec80_port.pt
+```
+
+This produces `onnx_stitch/stitch.onnx`, `onnx_stitch/stitch_init.onnx`, and FP16 variants.
+
+**Step 2 — Export to TensorRT engine**
+
+```bash
+python exp/export_trt.py \
+    --onnx-step onnx_stitch/stitch.onnx \
+    --out-dir trt_engine \
+    --fp16
+```
+
+**Step 3 — Benchmark**
+
+```bash
+# FP32
+python exp/bench_onnx.py \
+    --onnx-file onnx_stitch/stitch.onnx \
+    --video VIDEO.mp4 \
+    --start 100 --end 1000 --warmup 100 \
+    --name results/stitch_seg_fp32.json
+
+# FP16
+python exp/bench_onnx.py \
+    --onnx-file onnx_stitch/stitch.onnx \
+    --video VIDEO.mp4 \
+    --start 100 --end 1000 --warmup 100 \
+    --fp16 \
+    --name results/stitch_seg_fp16.json
+```
+
+---
+
+### Benchmark output format
+
+Each benchmark writes a JSON file such as:
+
+```json
+{
+  "model": { "onnx_file": "...", "fp16": false, "providers": ["CUDAExecutionProvider"] },
+  "benchmark": { "measured_frames": 901, "reset_count": 0 },
+  "latency_ms": { "mean": 12.3, "p50": 11.9, "p95": 14.2, "p99": 18.1 },
+  "fps": { "mean": 81.3, "at_p95_latency": 70.4 },
+  "per_frame_ms": [...]
+}
 ```
 
 ---
@@ -122,55 +267,55 @@ Default values live in `stitch_seg/config.py` (`DEFAULT_CFG_VALUES`). Common kno
 
 - **stitch / features**: `method`, `canvas_scale_x/y`, `feature_*`, `feature_ransac_thresh`
 - **masking**: `seg_min_score`, `seg_max_coverage`, `tool_mask_dilate_px`
-- **depth**: `enable_depth_mask`, `depth_anything_v2_model`
 - **device**: `device`
 
 ---
 
 ## Repository layout (high level)
 
-- `stitch_seg/`: library code
-  - `inferencer.py`: `StitchInferencer` (stitch + inference + inverse warp)
-  - `models.py`: loaders for tool detector / depth / feature pipeline
-  - `stitch_utils_torch.py`: geometry/warping/mask utilities
-- `weights/`: default weight locations (may vary by your environment)
-- `main.py`: example runner
+```
+stitch_seg/          # Library code
+  inferencer.py      # StitchInferencer (stitch + inference + inverse warp)
+  models.py          # Loaders for tool detector / feature pipeline
+  stitch_utils_torch.py  # Geometry / warping / mask utilities
+  lightglue/         # ALIKED + LightGlue (standard PyTorch)
+  lightglue_dynamo/  # ONNX-exportable variant with custom ONNX operators
+  onnx_exporters/    # Custom ONNX symbolic registrations
+
+exp/                 # Experiment scripts (run as python -m exp.<script>)
+  export_onnx.py     # Export stitch+seg full pipeline to ONNX
+  export_onnx_only.py    # Export stitch-only pipeline to ONNX
+  export_onnx_seg.py     # Export seg-only model to ONNX
+  export_trt.py      # Build TensorRT engines (stitch+seg)
+  export_trt_only.py     # Build TensorRT engines (stitch-only)
+  bench_onnx.py      # Benchmark stitch+seg ONNX
+  bench_onnx_only.py     # Benchmark stitch-only ONNX
+  bench_onnx_seg.py      # Benchmark seg-only ONNX
+  run_onnx.py        # Run stitch+seg ONNX inference on a video
+  run_onnx_only.py   # Run stitch-only ONNX inference
+  run_tensorrt.py    # Run with TensorRT EP
+
+weights/             # Default weight file locations
+.devcontainer/       # VS Code DevContainer (TensorRT base image)
+```
 
 ---
 
 ## Troubleshooting
 
 - **`import stitch_seg` works but `from stitch_seg import StitchInferencer` fails**
-  - `StitchInferencer` pulls in heavy runtime deps (e.g. `ptlflow`). Ensure **Python >= 3.9**, and that your `ptlflow`/`torch` stack is compatible.
+  - Ensure **Python >= 3.9** and that your PyTorch stack is compatible.
 - **Missing weights / relative path errors**
-  - Use **absolute paths** for `cfg.aliked_weights`, `cfg.lightglue_weights`, and `cfg.tool_detector_weights`.
-- **Depth masking crashes**
-  - Provide a valid checkpoint at `cfg.depth_anything_v2_model` (the default points outside this repo).
-
----
-
-## Development
-
-- Editable install:
-
-```bash
-python3 -m pip install -e .
-```
-
-- Reproducible deps:
-  - If you use `uv`, `uv.lock` is the reference.
-
----
-
-## Contributing
-
-Issues and PRs are welcome. Please include repro details (video conditions, your `CFG`/`cfg`, and logs).
+  - Use **absolute paths** for all `cfg.*_weights` fields.
+- **TRT engine produces NaN**
+  - The step model's homography subgraph is sensitive to TRT kernel fusion. Use the provided `export_trt.py` which applies the Div-node workaround automatically.
+- **CUDA extension build fails on startup**
+  - Install `ninja` (`pip install ninja`) to enable JIT compilation of custom CUDA kernels. The library falls back to pure PyTorch if `ninja` is unavailable.
 
 ---
 
 ## License
-
-TBD (add a `LICENSE` file if you plan to distribute).
+CC BY-NC-SA 4.0
 
 ---
 
@@ -178,8 +323,13 @@ TBD (add a `LICENSE` file if you plan to distribute).
 
 This project depends on / is inspired by:
 
-- LightGlue / ALIKED
-- ptlflow
-- Video Depth Anything–style models
+- LightGlue / ALIKED (alikked-tensorrt, LightGlue-ONNX as well)
+- segmentation-models-pytorch
 
-
+Please Cite Our Work in your research:
+```
+@misc{stitchinferencer,
+title={From Frame to Panorama: Learning-Free Spatial Memory via Stitch-Inferencer for Real-Time Surgical Video Understanding},
+author={Kikuchi, Shunsuke and Kouno, Atushi and Matsuzaki, Hiroki},
+}
+```
