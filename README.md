@@ -271,37 +271,8 @@ Default values live in `stitch_seg/config.py` (`DEFAULT_CFG_VALUES`). Common kno
 
 ---
 
-## Repository layout (high level)
-
-```
-stitch_seg/          # Library code
-  inferencer.py      # StitchInferencer (stitch + inference + inverse warp)
-  models.py          # Loaders for tool detector / feature pipeline
-  stitch_utils_torch.py  # Geometry / warping / mask utilities
-  lightglue/         # ALIKED + LightGlue (standard PyTorch)
-  lightglue_dynamo/  # ONNX-exportable variant with custom ONNX operators
-  onnx_exporters/    # Custom ONNX symbolic registrations
-
-exp/                 # Experiment scripts (run as python -m exp.<script>)
-  export_onnx.py     # Export stitch+seg full pipeline to ONNX
-  export_onnx_only.py    # Export stitch-only pipeline to ONNX
-  export_onnx_seg.py     # Export seg-only model to ONNX
-  export_trt.py      # Build TensorRT engines (stitch+seg)
-  export_trt_only.py     # Build TensorRT engines (stitch-only)
-  bench_onnx.py      # Benchmark stitch+seg ONNX
-  bench_onnx_only.py     # Benchmark stitch-only ONNX
-  bench_onnx_seg.py      # Benchmark seg-only ONNX
-  run_onnx.py        # Run stitch+seg ONNX inference on a video
-  run_onnx_only.py   # Run stitch-only ONNX inference
-  run_tensorrt.py    # Run with TensorRT EP
-
-weights/             # Default weight file locations
-.devcontainer/       # VS Code DevContainer (TensorRT base image)
-```
-
----
-
 ## License
+Please read `LICENSE.txt`
 CC BY-NC-SA 4.0
 
 ---
