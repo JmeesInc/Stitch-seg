@@ -301,19 +301,6 @@ weights/             # Default weight file locations
 
 ---
 
-## Troubleshooting
-
-- **`import stitch_seg` works but `from stitch_seg import StitchInferencer` fails**
-  - Ensure **Python >= 3.9** and that your PyTorch stack is compatible.
-- **Missing weights / relative path errors**
-  - Use **absolute paths** for all `cfg.*_weights` fields.
-- **TRT engine produces NaN**
-  - The step model's homography subgraph is sensitive to TRT kernel fusion. Use the provided `export_trt.py` which applies the Div-node workaround automatically.
-- **CUDA extension build fails on startup**
-  - Install `ninja` (`pip install ninja`) to enable JIT compilation of custom CUDA kernels. The library falls back to pure PyTorch if `ninja` is unavailable.
-
----
-
 ## License
 CC BY-NC-SA 4.0
 
