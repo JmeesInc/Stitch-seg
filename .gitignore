@@ -8,12 +8,26 @@ dist/
 wheels/
 video/
 long/
-cjec
 *.egg-info
 
 # Virtual environments
 .venv
 
+# Heavy / generated files
 *.mp4
 *.onnx
+*.engine
+
+# Large directories (models, weights, data)
+models/
+weights/
+data/Cholec80
+data/CholecSeg8k
+
+# JSON: ignore outputs and local settings, keep configs
+*.json
+!.devcontainer/devcontainer.json
+!profiile/*.json
+
+# Optional (remove if you want to commit)
 CLAUDE.md

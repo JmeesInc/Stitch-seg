@@ -12,14 +12,12 @@ import matplotlib.pyplot as plt
 from .models import (
     load_masking_model,
     load_masking_model2,
-    load_depth_model,
     init_feature_pipeline,
 )
 from .config import apply_stitch_defaults, build_default_cfg
 from .stitch_utils_torch import (
     compute_static_roi,
     equalize_hist_rgb,
-    compute_depth_mask,
     merge_masks,
     warp_with_transform,
     filter_features_by_mask,
@@ -40,7 +38,7 @@ class StitchInferencerDev(nn.Module):
 
     Flow summary:
       1. Preprocess + crop each raw frame using `compute_static_roi`.
-      2. Obtain tool/depth masks + motion estimates to build clean canvases.
+      2. Obtain tool masks + motion estimates to build clean canvases.
       4. For every frame, estimate camera shift, paste onto both canvases,
          and cache the homography so predictions can be warped back.
       5. When `model_inference` is called, crop the mask-free canvas around
@@ -72,7 +70,6 @@ class StitchInferencerDev(nn.Module):
             K.Resize(size=(512, 512)),
             K.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         )
-        self.depth_model = load_depth_model(cfg)
         self.extractor, self.matcher = init_feature_pipeline(cfg)
         
         self.scope_kernel = torch.ones(5, 5, device=self.device)
@@ -210,19 +207,13 @@ class StitchInferencerDev(nn.Module):
         """
         input: (1, 3, H, W) RGB uint8/float
         output: tool_mask: (H, W) uint8 (device on self.device)
-                depth_mask: (H, W) uint8 (device on self.device)
         """
         input_img = self.seg_processor(frame_u/255.0)
         # `input_img` is already (B, C, H, W). Do NOT add an extra batch dimension.
-        input_img_dpt = torch.nn.functional.interpolate(input_img, size=(518, 518), mode='bilinear', align_corners=False)
-        depth_tensor = None
         # Pure inference: avoid autograd graphs to reduce VRAM usage.
         with torch.inference_mode(), torch.autocast(dtype=torch.float16, device_type=self.device.type, enabled=True):
             masking = self.masking_model(input_img)
             masking2 = self.masking_model2(input_img)
-            if self.depth_model is not None:
-                depth_feature = self.depth_model.forward_features(input_img_dpt)
-                depth_tensor = self.depth_model.forward_depth(depth_feature, input_img_dpt.shape)[0]
         
         masking = torch.nn.functional.interpolate(masking, size=frame_u.shape[-2:], mode='bilinear', align_corners=False)
         masking2 = torch.nn.functional.interpolate(masking2, size=frame_u.shape[-2:], mode='bilinear', align_corners=False)
@@ -230,16 +221,10 @@ class StitchInferencerDev(nn.Module):
         masking2 = (masking2 > 0.5).to(torch.uint8) * 255
         masking = masking | masking2
         
-        if depth_tensor is not None:
-            depth_tensor = torch.nn.functional.interpolate(depth_tensor, size=frame_u.shape[-2:], mode='bilinear', align_corners=False)
-            depth_mask = compute_depth_mask(depth_tensor, self.cfg)
-        else:
-            depth_mask = None
-        
         if self.apply_ellipse_mask:
             masking = masking | torch.nn.functional.interpolate(self.ellipse_mask.float(), size=frame_u.shape[-2:], mode='nearest').long()
         
-        return masking, depth_mask
+        return masking
 
     def _current_to_canvas_h(self):
         scale = getattr(self.cfg, "canvas_superres_scale", 1.0)
@@ -338,6 +323,9 @@ class StitchInferencerDev(nn.Module):
 
                         if not changed:
                             break
+        elif mode == "entire":
+            x1, y1 = 0, 0
+            x2, y2 = self.canvas4model.shape[-1], self.canvas4model.shape[-2]
         elif mode == "external":
             if self.canvas4model_mask is None:
                 x1, y1, x2, y2 = _original_bbox()
@@ -430,7 +418,7 @@ class StitchInferencerDev(nn.Module):
                 warped_pred[:, int(self.cfg.tool_class_ch), :, :] = self.last_tool_mask.squeeze(0).float()
         return warped_pred.squeeze(0) # (Classes, H, W)
     
-    def first_frame(self, frame_u, tool_mask_raw, depth_mask_raw, current_img=None):
+    def first_frame(self, frame_u, tool_mask_raw, current_img=None):
         if self.canvas4model is None:
             # `current_img` is what gets pasted into the canvas.
             # - For normal stitching: current_img = frame_u (RGB, 3ch)
@@ -463,7 +451,7 @@ class StitchInferencerDev(nn.Module):
 
             self.prev_rgb_raw = frame_u.clone()
             self.prev_stab_transform = torch.eye(3, device=self.device)
-            combined_mask_raw = merge_masks(tool_mask_raw, depth_mask_raw)
+            combined_mask_raw = tool_mask_raw
             self.combined_mask_prev_raw = combined_mask_raw
             # Features
             tensor_lg = self._to_lightglue_gray(frame_u)
@@ -498,15 +486,15 @@ class StitchInferencerDev(nn.Module):
             use_tps = transform_mode == "tps"
             tps_params = None
             # === 1. Predict Masks ===
-            tool_mask_raw, depth_mask_raw = self._predict_masks(frame_u)
+            tool_mask_raw = self._predict_masks(frame_u)
             # === 2. Convert to Grayscale for Flow ===
             # === 3. Initialization ===
             if self.canvas4model is None:
-                self.first_frame(frame_u, tool_mask_raw, depth_mask_raw)
+                self.first_frame(frame_u, tool_mask_raw)
                 return
 
             # === 5. Mask Merge ===
-            combined_mask_raw = merge_masks(tool_mask_raw, depth_mask_raw)
+            combined_mask_raw = tool_mask_raw
 
             # === 6. Feature Extraction ===
             tensor_lg = self._to_lightglue_gray(frame_u)
@@ -808,7 +796,7 @@ class StitchInferencerDev(nn.Module):
             use_tps = transform_mode == "tps"
             tps_params = None
             # === 1. Predict Masks ===
-            tool_mask_raw, depth_mask_raw = self._predict_masks(frame_u)
+            tool_mask_raw = self._predict_masks(frame_u)
             # === 2. Convert to Grayscale for Flow ===
             # === 3. Initialization ===
             if self.canvas4model is None:
@@ -818,12 +806,12 @@ class StitchInferencerDev(nn.Module):
                 if pred_b.dim() == 3:
                     pred_b = pred_b.unsqueeze(0)
                 # Initialize canvas in "prediction space" (C = num_classes)
-                self.first_frame(frame_u, tool_mask_raw, depth_mask_raw, current_img=pred_b)
+                self.first_frame(frame_u, tool_mask_raw, current_img=pred_b)
                 # Return stitched prediction in the current frame space
                 return self._warp_canvas_pred_to_current(frame_u.shape[-2:], H_cum=self.H_cum, tool_mask=tool_mask_raw)
 
             # === 5. Mask Merge ===
-            combined_mask_raw = merge_masks(tool_mask_raw, depth_mask_raw)
+            combined_mask_raw = tool_mask_raw
 
             # === 6. Feature Extraction ===
             tensor_lg = self._to_lightglue_gray(frame_u)
@@ -855,7 +843,7 @@ class StitchInferencerDev(nn.Module):
                     #H_cum_curr = self.H_cum @ torch.linalg.inv(H_rel_t)
                 if isinstance(H_inv, tuple):
                     self.reset_state()
-                    self.first_frame(frame_u, tool_mask_raw, depth_mask_raw)
+                    self.first_frame(frame_u, tool_mask_raw)
                     return
                 H_cum_curr = self.H_cum @ H_inv
 

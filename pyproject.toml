@@ -51,13 +51,13 @@ include = ["stitch_seg*"]
 
 [tool.uv.sources]
 torch = [
-    { index = "torch-cu118" },
+    { index = "torch-cu126" },
 ]
 torchvision = [
-    { index = "torch-cu118"},
+    { index = "torch-cu126"},
 ]
 
 [[tool.uv.index]]
-name = "torch-cu118"
-url = "https://download.pytorch.org/whl/cu118"
+name = "torch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
 explicit = true

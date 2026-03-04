@@ -97,7 +97,7 @@ def equalize_hist_rgb(img_rgb: torch.Tensor) -> torch.Tensor:
 
 
 # -----------------------------------------------------------------------------
-# 2. Segmentation & Depth
+# 2. Segmentation
 # -----------------------------------------------------------------------------
 
 
@@ -176,34 +176,6 @@ def get_tool_class_ids(model, cfg):
                 if isinstance(k_int, int):
                     tool_ids.append(k_int)
     return tool_ids
-
-
-def compute_depth_mask(depth_map: torch.Tensor, cfg) -> torch.Tensor:
-    """
-    depth_map: (B, 1, H, W)
-    """
-        
-    valid = torch.isfinite(depth_map)
-    if not valid.any():
-        return None
-        
-    depth_valid = depth_map[valid]
-    
-    # Percentile logic
-    # torch.quantile requires float input
-    thresh = torch.quantile(depth_map[valid], cfg.depth_close_percentile / 100.0)
-    
-    mask = torch.zeros_like(depth_map, dtype=torch.uint8)
-    mask[(valid) & (depth_map >= thresh)] = 255
-    
-    # Morphological Closing
-    # Kernel 5x5 ellipse
-    # Kornia closing
-    kernel = torch.ones(5, 5, device=depth_map.device) # Ellipse approx by Rect or custom kernel
-    mask_closed = kornia.morphology.closing(mask.float(), kernel)
-    
-    return (mask_closed > 0).to(torch.uint8) * 255
-
 
 def merge_masks(*masks):
     combined = None

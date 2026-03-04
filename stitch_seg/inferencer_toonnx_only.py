@@ -11,8 +11,6 @@ from .models import (
 from .lightglue_dynamo import ALIKED, LightGlue
 from .config import apply_stitch_defaults, build_default_cfg
 
-import nvtx
-
 try:
     from .cuda_ops import fused_warp_perspective as _cuda_warp, fast_gradient_mask_cuda as _cuda_grad_mask, is_available as _cuda_ops_available
     _USE_CUDA_OPS = _cuda_ops_available()
@@ -20,7 +18,7 @@ except ImportError:
     _USE_CUDA_OPS = False
     print("[warn] CUDA ops not available")
 
-class StitchInferencer_ONNX(nn.Module):
+class Stitcher_ONNX(nn.Module):
     """Stateful stitching engine that exposes stitched crops to a seg model.
 
     Flow summary:
@@ -33,18 +31,15 @@ class StitchInferencer_ONNX(nn.Module):
          into the current frame space.
     """
 
-    def __init__(self, model, cfg=None, input_size=(480, 854)):
+    def __init__(self, cfg=None, input_size=(480, 854)):
         super().__init__()
         if cfg is None:
             cfg = build_default_cfg()
         else:
             cfg = apply_stitch_defaults(cfg)
-        self.model = model
         self.cfg = cfg
-        self.num_classes = cfg.num_classes
         self.device = cfg.device
         self.apply_ellipse_mask = bool(getattr(cfg, "apply_ellipse_mask", True))
-        self.tool_class_ch = int(getattr(cfg, "tool_class_ch", 0))
         self.masking_model = load_masking_model(cfg)
         self.masking_model2 = load_masking_model2(cfg)
         self.masking_input_size = (512, 512)
@@ -103,6 +98,7 @@ class StitchInferencer_ONNX(nn.Module):
         """
         input: (1, 3, H, W) RGB uint8/float
         output: tool_mask: (H, W) uint8 (device on self.device)
+                depth_mask: (H, W) uint8 (device on self.device)
         """
         input_img = F.interpolate(
             frame_u / 255.0, 
@@ -125,212 +121,6 @@ class StitchInferencer_ONNX(nn.Module):
         masking_bool = masking_bool | ellipse_bool
 
         return masking_bool.to(torch.uint8) * 255
-
-    def _current_to_canvas_h(self, H_cum):
-        # Apply scale first, then translate so the offset is not scaled again.
-        H_cum = H_cum.clone()
-        H_cum = H_cum.to(torch.float32)
-        ret = self.S @ self.T @ H_cum
-        return ret
-
-    def _current_canvas_bbox(self, frame_shape, canvas4model_mask: torch.Tensor, H_cum_curr: torch.Tensor):
-        # --- 1. 初期BBoxの計算 (投影) ---
-        H = self._current_to_canvas_h(H_cum_curr)
-        pts = torch.cat([self.corners, torch.ones((4, 1), device=self.device)], dim=1)
-        proj = (H @ pts.T).T
-        denom = torch.clamp(proj[:, 2:3], min=torch.tensor(1e-6, device=self.device))
-        proj_xy = proj[:, :2] / denom
-        # NaN/Inf can collapse bbox to an empty slice; ORT CUDA reduction kernels error on dim=0.
-        proj_xy = torch.where(torch.isfinite(proj_xy), proj_xy, torch.zeros_like(proj_xy))
-
-        H_mask, W_mask = canvas4model_mask.shape[-2:]
-        mask = canvas4model_mask.squeeze() # [H, W]
-
-        # 初期BBoxの座標を計算
-        xs = torch.clamp(proj_xy[:, 0], min=torch.tensor(0, device=self.device), max=torch.tensor(W_mask, device=self.device))
-        ys = torch.clamp(proj_xy[:, 1], min=torch.tensor(0, device=self.device), max=torch.tensor(H_mask, device=self.device))
-        
-        x1 = xs.min().to(torch.int64)
-        y1 = ys.min().to(torch.int64)
-        x2 = (xs.max() + 1).to(torch.int64)
-        y2 = (ys.max() + 1).to(torch.int64)
-
-        # --- 2. 拡張ロジックの非ループ化 ---
-        # 元のコードの「BBox内がすべて有効なら拡張する」を判定
-        # スライスサイズが動的だとコンパイルに響くため、mask[y1:y2, x1:x2] は慎重に扱う
-        # ここでは論理的なフラグとして保持
-        is_valid = (x2 > x1) & (y2 > y1)
-        
-        # 10回のループを回す代わりに、現在のBBoxの上下左右の「壁」を一度にスキャンします。
-        # ONNX化を容易にするため、反復ではなく「一方向への最大拡張」を1段ずつ計算するか、
-        # 複雑な依存関係がある場合は固定回数(例:2回程度)に限定するのがコツです。
-
-        def expand_step(b_x1, b_y1, b_x2, b_y2):
-            """Expand bbox in each direction while mask is fully valid.
-
-            Uses cumprod + padding instead of cummax (unsupported in ONNX) or
-            dynamic Slice (creates TRT shape-tensor issues).
-
-            Key idea: to count consecutive valid values ending at position x1-1,
-            pad positions >= x1 with 1.0, flip, cumprod, sum, then subtract
-            the padding count. cumprod is already ONNX-exportable via custom op.
-            """
-            w_lim = torch.tensor(W_mask, device=self.device, dtype=torch.int64)
-            h_lim = torch.tensor(H_mask, device=self.device, dtype=torch.int64)
-            zero = torch.tensor(0, device=self.device, dtype=torch.int64)
-            one = torch.tensor(1, device=self.device, dtype=torch.int64)
-            f_zero = torch.tensor(0.0, device=self.device, dtype=torch.float32)
-
-            # Ensure non-empty bbox
-            b_x1 = torch.minimum(torch.maximum(b_x1, zero), w_lim - one)
-            b_y1 = torch.minimum(torch.maximum(b_y1, zero), h_lim - one)
-            b_x2 = torch.minimum(torch.maximum(b_x2, b_x1 + one), w_lim)
-            b_y2 = torch.minimum(torch.maximum(b_y2, b_y1 + one), h_lim)
-
-            # --- Column validity: which columns are fully valid across [y1:y2]? ---
-            row_idx = torch.arange(H_mask, device=self.device, dtype=torch.int64)
-            col_idx = torch.arange(W_mask, device=self.device, dtype=torch.int64)
-            row_sel = (row_idx >= b_y1) & (row_idx < b_y2)  # [H] bool
-            bbox_h = (b_y2 - b_y1).float()
-            col_valid = ((mask > 0).float() * row_sel.unsqueeze(1).float()).sum(0) >= bbox_h  # [W] bool
-            v_col = col_valid.float()  # [W], 1.0=valid, 0.0=invalid
-
-            # --- Left expansion (consecutive valid cols ending at x1-1) ---
-            # Pad positions >= x1 with 1.0, flip, cumprod, sum.
-            # cumprod of 0/1 after flip counts consecutive 1s from the right end
-            # of the padded array. Subtracting the padding count (W - x1) gives
-            # the actual run length ending at x1-1.
-            has_left = b_x1 > zero
-            v_left = torch.where(col_idx >= b_x1, torch.ones_like(v_col), v_col)
-            cp_left = v_left.flip(0).cumprod(0)
-            expand_l_raw = torch.maximum(cp_left.sum() - (w_lim - b_x1).float(), f_zero).to(torch.int64)
-            expand_l = torch.where(has_left, expand_l_raw, zero)
-            new_x1 = b_x1 - expand_l
-
-            # --- Right expansion (consecutive valid cols starting at x2) ---
-            # Pad positions < x2 with 1.0, cumprod from left, sum.
-            has_right = b_x2 < w_lim
-            v_right = torch.where(col_idx < b_x2, torch.ones_like(v_col), v_col)
-            cp_right = v_right.cumprod(0)
-            expand_r_raw = torch.maximum(cp_right.sum() - b_x2.float(), f_zero).to(torch.int64)
-            expand_r = torch.where(has_right, expand_r_raw, zero)
-            new_x2 = b_x2 + expand_r
-            new_x1 = torch.minimum(torch.maximum(new_x1, zero), w_lim - one)
-            new_x2 = torch.minimum(torch.maximum(new_x2, new_x1 + one), w_lim)
-
-            # --- Row validity: which rows are fully valid across [new_x1:new_x2]? ---
-            col_sel = (col_idx >= new_x1) & (col_idx < new_x2)  # [W] bool
-            bbox_w = (new_x2 - new_x1).float()
-            row_valid = ((mask > 0).float() * col_sel.unsqueeze(0).float()).sum(1) >= bbox_w  # [H] bool
-            v_row = row_valid.float()  # [H]
-
-            # --- Top expansion (consecutive valid rows ending at y1-1) ---
-            has_top = b_y1 > zero
-            v_top = torch.where(row_idx >= b_y1, torch.ones_like(v_row), v_row)
-            cp_top = v_top.flip(0).cumprod(0)
-            expand_t_raw = torch.maximum(cp_top.sum() - (h_lim - b_y1).float(), f_zero).to(torch.int64)
-            expand_t = torch.where(has_top, expand_t_raw, zero)
-            new_y1 = b_y1 - expand_t
-
-            # --- Bottom expansion (consecutive valid rows starting at y2) ---
-            has_bottom = b_y2 < h_lim
-            v_bottom = torch.where(row_idx < b_y2, torch.ones_like(v_row), v_row)
-            cp_bottom = v_bottom.cumprod(0)
-            expand_b_raw = torch.maximum(cp_bottom.sum() - b_y2.float(), f_zero).to(torch.int64)
-            expand_b = torch.where(has_bottom, expand_b_raw, zero)
-            new_y2 = b_y2 + expand_b
-            new_y1 = torch.minimum(torch.maximum(new_y1, zero), h_lim - one)
-            new_y2 = torch.minimum(torch.maximum(new_y2, new_y1 + one), h_lim)
-
-            return new_x1, new_y1, new_x2, new_y2
-
-        # Clamp to canvas bounds and enforce non-empty bbox for stable reductions on CUDA.
-        w_lim = torch.tensor(W_mask, device=self.device, dtype=torch.int64)
-        h_lim = torch.tensor(H_mask, device=self.device, dtype=torch.int64)
-        zero = torch.tensor(0, device=self.device, dtype=torch.int64)
-        one = torch.tensor(1, device=self.device, dtype=torch.int64)
-        x1s = torch.minimum(torch.maximum(x1, zero), w_lim - one)
-        y1s = torch.minimum(torch.maximum(y1, zero), h_lim - one)
-        x2s = torch.minimum(torch.maximum(x2, x1s + one), w_lim)
-        y2s = torch.minimum(torch.maximum(y2, y1s + one), h_lim)
-        nx1, ny1, nx2, ny2 = expand_step(x1s, y1s, x2s, y2s)
-        
-        # 全体が有効だった場合のみ更新を適用
-        res_x1 = torch.where(is_valid, nx1, x1)
-        res_y1 = torch.where(is_valid, ny1, y1)
-        res_x2 = torch.where(is_valid, nx2, x2)
-        res_y2 = torch.where(is_valid, ny2, y2)
-
-        return res_x1, res_y1, res_x2, res_y2
-    
-    @nvtx.annotate(message="forward", color="green")
-    def forward(self, frame: torch.Tensor, ellipse_mask: torch.Tensor, H_cum_curr: torch.Tensor, prev_keypoints: torch.Tensor, prev_descriptors: torch.Tensor, canvas: torch.Tensor, canvas_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Returns: Seg Map Tensor (Classes, H, W)
-        """
-        canvas, canvas_mask, canvas4model, canvas4model_mask, H_cum_curr, prev_keypoints, prev_descriptors, combined_mask_raw, needs_reset = self.step_canvas(
-            frame, ellipse_mask, H_cum_curr, prev_keypoints, prev_descriptors, canvas, canvas_mask)
-        
-        frame_shape = frame.shape[-2:]
-
-        x1, y1, x2, y2 = self._current_canvas_bbox(frame_shape, canvas4model_mask, H_cum_curr)
-
-        # Crop via warp_perspective (no dynamic Slice → TRT-compatible)
-        # Build a crop homography: maps bbox region to fixed-size output
-        crop_h, crop_w = frame_shape  # fixed size (same as input frame)
-        x1f, y1f = x1.float(), y1.float()
-        x2f, y2f = x2.float(), y2.float()
-        sx = crop_w / (x2f - x1f + 1e-6)
-        sy = crop_h / (y2f - y1f + 1e-6)
-        z = torch.zeros(1, device=self.device, dtype=torch.float32)
-        o = torch.ones(1, device=self.device, dtype=torch.float32)
-        M_crop = torch.stack([
-            torch.cat([sx.unsqueeze(0), z, (-x1f * sx).unsqueeze(0)]),
-            torch.cat([z, sy.unsqueeze(0), (-y1f * sy).unsqueeze(0)]),
-            torch.cat([z, z, o]),
-        ], dim=0)  # [3, 3]
-        crop = warp_perspective_onnx(canvas4model, M_crop.unsqueeze(0), (crop_h, crop_w))
-
-        # Model Inference (crop is (1, 3, crop_h, crop_w) — fixed size)
-        with nvtx.annotate(message="model_inference", color="blue"):
-            canvas_out = self.model(crop)
-
-        # Resize output to crop size (in case model output different stride)
-        canvas_out = F.interpolate(canvas_out, size=(crop_h, crop_w), mode='bilinear', align_corners=False)
-
-        # Paste via warp_perspective (no ScatterND → TRT-compatible)
-        # Build inverse of crop homography: maps fixed-size output back to canvas coords
-        ch, cw = canvas4model.shape[-2], canvas4model.shape[-1]
-        M_paste = torch.stack([
-            torch.cat([(x2f - x1f).unsqueeze(0) / crop_w, z, x1f.unsqueeze(0)]),
-            torch.cat([z, (y2f - y1f).unsqueeze(0) / crop_h, y1f.unsqueeze(0)]),
-            torch.cat([z, z, o]),
-        ], dim=0)  # [3, 3]
-        canvas_pred = warp_perspective_onnx(canvas_out, M_paste.unsqueeze(0), (ch, cw))
-
-        self.last_model_input = crop
-        self.last_model_output = canvas_out
-        
-        # Warp back to current frame
-        h, w = frame_shape
-        H = self._current_to_canvas_h(H_cum_curr)
-        H_canvas_to_curr = inverse_3x3_onnx(H.unsqueeze(0))
-        # Warp (1, Classes, H_canv, W_canv) -> (1, Classes, H, W)
-        if _USE_CUDA_OPS and not torch.onnx.is_in_onnx_export():
-            warped_pred = _cuda_warp(canvas_pred, H_canvas_to_curr, h, w, mode=1)
-        else:
-            warped_pred = warp_perspective_onnx(canvas_pred, H_canvas_to_curr, (h, w))
-
-        ellipse_mask = F.interpolate(
-            ellipse_mask.float(), size=(h, w), mode="nearest"
-        )
-        warped_pred[:, 0:1, :, :] += ellipse_mask * 255.0
-        warped_pred[:, 1:, :, :] = warped_pred[:, 1:, :, :] * (1.0 - ellipse_mask)
-        # Optionally inject tool mask into a dedicated class channel.
-        # IMPORTANT: For binary segmentation (num_classes=1), injecting would overwrite the only channel
-        # and make downstream visualizations look like "tool segmentation".
-        warped_pred[:, self.tool_class_ch, :, :] = combined_mask_raw.squeeze(0).float()
-        return warped_pred.squeeze(0), canvas, canvas_mask, H_cum_curr, prev_keypoints, prev_descriptors, needs_reset
     
     def first_frame(self, frame_u, ellipse_mask):
         print("canvas is initialized")
@@ -347,24 +137,12 @@ class StitchInferencer_ONNX(nn.Module):
         curr_desc = F.pad(curr_desc, (0, 0, 0, 2048 - curr_desc.shape[1]), mode='constant', value=0.0)
         H_cum = torch.eye(3, device=self.device)
         # Paste
-        canvas, canvas_mask, _, _ = self.paste_current_to_canvas_forward_multiband(
+        canvas, canvas_mask = self.paste_current_to_canvas_forward_multiband(
             canvas, canvas_mask, H_cum, self.T, self.S, frame_u, combined_mask_raw
         )
-
-        # オリジナルフレームに対して直接モデル推論を行い seg_map を生成
-        seg_map = self.model(frame_u)  # (1, Classes, H, W)
-        seg_map = F.interpolate(seg_map, size=(h0, w0), mode='bilinear', align_corners=False)
-
-        # ellipse_mask / ツールマスク合成 (forward() と同じロジック)
-        ellipse_resized = F.interpolate(ellipse_mask.float(), size=(h0, w0), mode="nearest")
-        seg_map[:, 0:1, :, :] += ellipse_resized * 255.0
-        seg_map[:, 1:, :, :] = seg_map[:, 1:, :, :] * (1.0 - ellipse_resized)
-        seg_map[:, self.tool_class_ch, :, :] = combined_mask_raw.squeeze(0).float()
-
-        return seg_map.squeeze(0), canvas, canvas_mask, H_cum, curr_kps, curr_desc
+        return canvas, canvas_mask, H_cum, curr_kps, curr_desc
     
-    @nvtx.annotate(message="step_canvas", color="red")
-    def step_canvas(self, frame_u: torch.Tensor, ellipse_mask: torch.Tensor, H_cum: torch.Tensor, prev_keypoints: torch.Tensor, prev_descriptors: torch.Tensor, canvas: torch.Tensor, canvas_mask: torch.Tensor):
+    def forward(self, frame_u: torch.Tensor, ellipse_mask: torch.Tensor, H_cum: torch.Tensor, prev_keypoints: torch.Tensor, prev_descriptors: torch.Tensor, canvas: torch.Tensor, canvas_mask: torch.Tensor):
         """
         Main logic step.
         frame_u: (1, 3, H, W) RGB Float
@@ -376,8 +154,8 @@ class StitchInferencer_ONNX(nn.Module):
         self.combined_mask_prev_raw = combined_mask_raw
         # === 3. Feature Extraction ===
         curr_kps, curr_desc, _ = self.extractor(frame_u / 255.0)
-        curr_kps = torch.stack(curr_kps, dim=0)
-        curr_desc = torch.stack(curr_desc, dim=0)
+        curr_kps = torch.stack(curr_kps, dim=0).detach()
+        curr_desc = torch.stack(curr_desc, dim=0).detach()
         curr_kps, curr_desc = filter_features_by_mask(curr_kps, curr_desc, combined_mask_raw, frame_u.shape[-2], frame_u.shape[-1])
             
         # === 4. Global Homography ===
@@ -417,12 +195,9 @@ class StitchInferencer_ONNX(nn.Module):
         H_est = find_homography_dlt_onnx(pts_curr, pts_prev, w=scores).squeeze(0)
         needs_reset = needs_reset | H_est.isinf().any()
         # needs_reset 時は単位行列で代用し、分岐なしで処理を続行
-        # FP16 では行列積の精度が不足するため float32 で累積
-        H_cum_f = H_cum.float()
-        H_est_f = H_est.float()
-        eye3 = torch.eye(3, device=self.device, dtype=torch.float32)
-        H_est_safe = torch.where(needs_reset, eye3, H_est_f)
-        H_cum = torch.where(needs_reset, eye3, H_cum_f @ H_est_safe).to(H_cum.dtype)
+        eye3 = torch.eye(3, device=self.device, dtype=H_cum.dtype)
+        H_est_safe = torch.where(needs_reset, eye3, H_est)
+        H_cum = torch.where(needs_reset, eye3, H_cum @ H_est_safe)
 
         # === 8. Paste Current Frame to Canvas (update canvas) ===
         blur = laplacian_var(frame_u.float()) < self.cfg.laplacian_var_min
@@ -431,7 +206,7 @@ class StitchInferencer_ONNX(nn.Module):
         # Keep inputs immutable for branch selection (blur/non-blur) using tensor ops.
         canvas_in = canvas.clone()
         canvas_mask_in = canvas_mask.clone()
-        new_canvas, new_canvas_mask, canvas4model, canvas4model_mask = self.paste_current_to_canvas_forward_multiband(
+        new_canvas, new_canvas_mask = self.paste_current_to_canvas_forward_multiband(
             canvas_in,
             canvas_mask_in,
             H_cum,
@@ -449,8 +224,8 @@ class StitchInferencer_ONNX(nn.Module):
         prev_descriptors = descs[1:]
         # === 9. Reset Logic === # degreeからradianにしてnumpy消したい
         H_cum = H_cum.to(torch.float32)
-        reset_canvas, reset_canvas_mask, reset_canvas4model, reset_canvas4model_mask = reset_canvas_orientation(
-            canvas, canvas_mask, canvas4model, canvas4model_mask, H_cum, self.T, self.S
+        reset_canvas, reset_canvas_mask = reset_canvas_orientation(
+            canvas, canvas_mask, H_cum, self.T, self.S
         )
 
         reset = self.get_reset_condition(H_cum).to(torch.bool)
@@ -458,11 +233,9 @@ class StitchInferencer_ONNX(nn.Module):
         eye3 = torch.eye(3, device=self.device, dtype=H_cum.dtype)
         canvas = torch.where(apply_reset, reset_canvas, canvas)
         canvas_mask = torch.where(apply_reset, reset_canvas_mask, canvas_mask)
-        canvas4model = torch.where(apply_reset, reset_canvas4model, canvas4model)
-        canvas4model_mask = torch.where(apply_reset, reset_canvas4model_mask, canvas4model_mask)
         H_cum = torch.where(apply_reset, eye3, H_cum)
 
-        return canvas, canvas_mask, canvas4model, canvas4model_mask, H_cum, prev_keypoints, prev_descriptors, combined_mask_raw, needs_reset
+        return canvas, canvas_mask, H_cum, prev_keypoints, prev_descriptors, needs_reset
 
     def get_reset_condition(self, H: torch.Tensor) -> torch.Tensor:
         """
@@ -559,8 +332,6 @@ class StitchInferencer_ONNX(nn.Module):
         Multiband Blending with Mask Softening (Erosion + Gaussian Blur).
         """
         device = current_img.device
-        canvas4model = canvas.clone()
-        canvas4model_mask = canvas_mask.clone()
         
         # --- 1. Preparation & Warping ---
         H_total = S @ T @ H_to_canvas.to(device)
@@ -591,58 +362,35 @@ class StitchInferencer_ONNX(nn.Module):
 
         c_img = img_to_warp.shape[1]
         packed = torch.cat([img_to_warp.float(), mask_b, mask4model_b, rm_b], dim=1)  # (1, C+3, H, W)
-        if _USE_CUDA_OPS and not torch.onnx.is_in_onnx_export():
-            warped_packed = _cuda_warp(packed, H_total.unsqueeze(0), ch, cw, mode=0)
-        else:
-            warped_packed = warp_perspective_onnx(
-                packed, (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
-            )
+        warped_packed = warp_perspective_onnx(
+            packed, (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
+        )
         warped = warped_packed[:, :c_img].to(canvas.dtype)
-        warped_mask = warped_packed[:, c_img:c_img + 1]
-        warped_mask4model = warped_packed[:, c_img + 1:c_img + 2]
+        warped_mask = warped_packed[:, c_img:c_img + 1] 
         warped_tool_mask = warped_packed[:, c_img + 2:c_img + 3]
 
         # Logic Masks (Binary)
         wm_bool = warped_mask > 0.5
-        wm4_bool = warped_mask4model > 0.5
         cm_bool = canvas_mask > 0
         wtm_bool = warped_tool_mask > 0.5
         
         valid_new_region = wm_bool & (~wtm_bool)
-        valid_new_region4model = wm4_bool & (~wtm_bool)
         
         overlap = valid_new_region & cm_bool
-        overlap4model = valid_new_region4model & cm_bool
         only_new = valid_new_region & (~cm_bool)
-        only_new4model = valid_new_region4model & (~cm_bool)
         blur_bool = blur.to(torch.bool)
         blur_bool = blur_bool.to(torch.bool)
-        init_case = (~cm_bool.any()).to(torch.bool)
         overlap_case = overlap.any().to(torch.bool)
 
         # Base update (non-overlap/only-new) is always safe to compute.
         canvas_base = torch.where(only_new, warped, canvas)
-        canvas4model_base = torch.where(only_new4model, warped, canvas4model)
         canvas_mask_base = torch.where(valid_new_region, torch.full_like(canvas_mask, 255), canvas_mask)
-        canvas4model_mask_base = torch.where(
-            valid_new_region4model,
-            torch.full_like(canvas4model_mask, 255),
-            canvas4model_mask,
-        )
 
         # --- 2. Blend overlap region on full canvas (no dynamic Slice/ScatterND) ---
-        # Compute gradient mask on the full valid_new_region mask.
-        # The gradient mask acts as blending weight: 1.0 in the interior, fading to 0 at edges.
-        roi_mask_full = valid_new_region.float()  # (1, 1, ch, cw)
-
-        # Build border mask: 1.0 at the edges of the valid region.
-        # Instead of inv_mask[..., 0, :] = 1.0 etc. on a dynamic crop,
-        # we use the full canvas mask where borders are naturally outside the valid region.
+        # Compute gradient mask on the full valid_new_region.
+        # inv_mask is naturally 1.0 outside the valid region, so border handling is implicit.
+        roi_mask_full = valid_new_region.float()
         inv_mask_full = 1.0 - roi_mask_full
-        # The gradient mask function needs borders to be 1 (invalid) so the gradient
-        # fades from the edge of the valid region inward. Since we're operating on the
-        # full canvas, the boundary of the valid region is already surrounded by 0s
-        # (invalid), so inv_mask_full naturally has 1.0 at and beyond the border.
 
         if _USE_CUDA_OPS and not torch.onnx.is_in_onnx_export():
             dist_out = _cuda_grad_mask(inv_mask_full, self.paste_alpha_radius, 4)
@@ -651,28 +399,15 @@ class StitchInferencer_ONNX(nn.Module):
         grad_in = 1.0 - dist_out
         update_weight = torch.clamp(grad_in * roi_mask_full, torch.tensor(0.0, device=self.device), torch.tensor(1.0, device=self.device))
 
-        # Apply blending on the full canvas (weight is 0 outside overlap → no change there)
+        # Apply blending on the full canvas (weight is 0 outside valid region → no change there)
         canvas_nb = canvas_base * (1.0 - update_weight) + warped.float() * update_weight
         canvas_nb = canvas_nb.to(canvas_base.dtype)
         canvas_nb = torch.where(overlap_case, canvas_nb, canvas_base)
 
-        # canvas4model: overwrite with warped where valid (no gradient blending needed)
-        roi_mask4model_full = valid_new_region4model.float()
-        mask4_bool_full = (roi_mask4model_full > 0.5).expand_as(warped)
-        canvas4model_nb = torch.where(mask4_bool_full, warped.to(canvas4model_base.dtype), canvas4model_base)
-        canvas4model_nb = torch.where(overlap_case, canvas4model_nb, canvas4model_base)
-
         # Branch selection (blur / non-blur) as tensor ops.
         canvas_out = torch.where(blur_bool, canvas_base, canvas_nb)
         canvas_mask_out = canvas_mask_base
-        canvas4model_out = torch.where(blur_bool, canvas4model_base, canvas4model_nb)
-        canvas4model_mask_out = canvas4model_mask_base
-
-        # Preserve the original initialization behavior for non-blur first write.
-        init_apply = init_case & (~blur_bool)
-        canvas4model_out = torch.where(init_apply, canvas_out, canvas4model_out)
-        canvas4model_mask_out = torch.where(init_apply, canvas_mask_out, canvas4model_mask_out)
-        return canvas_out, canvas_mask_out, canvas4model_out, canvas4model_mask_out
+        return canvas_out, canvas_mask_out
     
     def fast_gradient_mask(self, mask: torch.Tensor) -> torch.Tensor:
         h, w = mask.shape[-2:]
@@ -725,7 +460,7 @@ def filter_features_by_mask(kps: torch.Tensor, desc: torch.Tensor, invalid_mask:
     desc = desc * keep_f
     return kps, desc
 
-def reset_canvas_orientation(canvas: torch.Tensor, canvas_mask: torch.Tensor, canvas4model, canvas4model_mask: torch.Tensor, H_to_canvas: torch.Tensor, T: torch.Tensor, S: torch.Tensor):
+def reset_canvas_orientation(canvas: torch.Tensor, canvas_mask: torch.Tensor, H_to_canvas: torch.Tensor, T: torch.Tensor, S: torch.Tensor):
     """
     Warp canvas back.
     canvas: (B, C, H, W)
@@ -744,7 +479,7 @@ def reset_canvas_orientation(canvas: torch.Tensor, canvas_mask: torch.Tensor, ca
     
     # 4. Warp
 
-    packed = torch.cat([canvas, canvas_mask, canvas4model, canvas4model_mask], dim=1).float()
+    packed = torch.cat([canvas, canvas_mask], dim=1).float()
     if _USE_CUDA_OPS and not torch.onnx.is_in_onnx_export():
         warped_packed = _cuda_warp(packed, M, ch, cw, mode=0).to(canvas.dtype)
     else:
@@ -754,17 +489,12 @@ def reset_canvas_orientation(canvas: torch.Tensor, canvas_mask: torch.Tensor, ca
 
     canvas_chs = canvas.shape[1]
     mask_chs = canvas_chs +canvas_mask.shape[1]
-    canvas4model_chs = mask_chs + canvas4model.shape[1]
-    canvas4model_mask_chs = canvas4model_chs + canvas4model_mask.shape[1]
-    
+
     warped_canvas = warped_packed[:, :canvas_chs]
     warped_mask = warped_packed[:, canvas_chs:mask_chs]
-    warped_canvas4model = warped_packed[:, mask_chs:canvas4model_chs]
-    warped_canvas4model_mask = warped_packed[:, canvas4model_chs:canvas4model_mask_chs]
     warped_mask = (warped_mask > 0).to(torch.uint8) * 255
-    warped_canvas4model_mask = (warped_canvas4model_mask > 0).to(torch.uint8) * 255
     
-    return warped_canvas, warped_mask, warped_canvas4model, warped_canvas4model_mask
+    return warped_canvas, warped_mask
 
 def inverse_3x3_onnx(M: torch.Tensor) -> torch.Tensor:
     """
@@ -772,10 +502,7 @@ def inverse_3x3_onnx(M: torch.Tensor) -> torch.Tensor:
     ループを使わないため、ONNXのTracerWarningを回避し、高速に動作します。
     M: [B, 3, 3] or [3, 3]
     """
-    # FP16 では行列式が underflow → NaN になるため float32 で計算
-    orig_dtype = M.dtype
-    M = M.float()
-
+    
     # 各要素の抽出
     a11, a12, a13 = M[:, 0, 0], M[:, 0, 1], M[:, 0, 2]
     a21, a22, a23 = M[:, 1, 0], M[:, 1, 1], M[:, 1, 2]
@@ -794,7 +521,7 @@ def inverse_3x3_onnx(M: torch.Tensor) -> torch.Tensor:
         torch.stack([a21 * a32 - a22 * a31, a12 * a31 - a11 * a32, a11 * a22 - a12 * a21], dim=-1)
     ], dim=1)
 
-    return (inv / det.unsqueeze(-1).unsqueeze(-1)).to(orig_dtype)
+    return inv / det.unsqueeze(-1).unsqueeze(-1)
 
 def _weighted_normalize_points(
     pts: torch.Tensor, w: torch.Tensor, eps: float = 1e-8
@@ -865,12 +592,6 @@ def find_homography_dlt_onnx(
         H: [B,3,3] (or [3,3] if input was unbatched)
     """
     # --- shape normalize to batched ---
-    # FP16 では行列反転・正規化が破綻するため float32 で計算
-    orig_dtype = pts0.dtype
-    pts0 = pts0.float()
-    pts1 = pts1.float()
-    w = w.float()
-
     unbatched = True
     pts0 = pts0.unsqueeze(0)
     pts1 = pts1.unsqueeze(0)
@@ -942,7 +663,7 @@ def find_homography_dlt_onnx(
     H22 = H[:, 2, 2].unsqueeze(1).unsqueeze(2).clamp_min(torch.tensor(eps, device=pts0.device))
     H = H / H22
 
-    return H[0].to(orig_dtype)
+    return H[0]
 
 def invmat(M):
     """Inverse of batched positive-definite matrix via Gauss-Jordan elimination.
@@ -956,9 +677,6 @@ def invmat(M):
     elimination step uses current matrix values directly without
     accumulating errors through matrix power iterations.
     """
-    # FP16 ではピボット除算が破綻するため float32 で計算
-    orig_dtype = M.dtype
-    M = M.float()
     B, N, _ = M.shape
     I_mat = torch.eye(N, device=M.device, dtype=M.dtype).unsqueeze(0).expand_as(M)
     aug = torch.cat([M, I_mat], dim=2)  # [B, N, 2N]
@@ -984,7 +702,7 @@ def invmat(M):
         sel = 1.0 - row_mask  # [1, N, 1]: 1 at row k, 0 elsewhere
         aug = aug * row_mask + aug_k * sel
 
-    return aug[:, :, N:].to(orig_dtype)  # Right half is the inverse
+    return aug[:, :, N:]  # Right half is the inverse
 
 def get_pixel_to_normalized_transform(H: int, W: int, device: torch.device, dtype: torch.dtype):
     """

@@ -3,9 +3,6 @@ import torch
 import segmentation_models_pytorch as smp
 from pathlib import Path
 
-from .video_depth_anything.video_depth_stream import VideoDepthAnything
-
-
 from .lightglue import ALIKED, LightGlue
 
 def init_feature_pipeline(cfg):
@@ -52,13 +49,3 @@ def load_masking_model2(cfg):
     seg_model.load_state_dict(state, strict=True)
     seg_model.eval()
     return seg_model
-
-def load_depth_model(cfg):
-    if VideoDepthAnything is None:
-        raise RuntimeError("VideoDepthAnything is not available")
-    if cfg.enable_depth_mask:
-        depth_model = VideoDepthAnything(encoder='vitl', features=256, out_channels=[256, 512, 1024, 1024])
-        depth_model.load_state_dict(torch.load(cfg.depth_anything_v2_model, map_location='cpu'), strict=True)
-        depth_model = depth_model.to(cfg.device).eval()
-        return depth_model
-    return None

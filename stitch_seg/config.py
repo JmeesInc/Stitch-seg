@@ -41,7 +41,6 @@ DEFAULT_CFG_VALUES = {
     "feature_ransac_thresh": 3.0,
     "feature_min_matches": 8,
     "feature_min_inliers": 15,
-    "depth_anything_v2_model": "../Video-Depth-Anything/checkpoints/video_depth_anything_vitl.pth",
     "optflow_pyr_scale": 0.5,
     "optflow_levels": 3,
     "optflow_winsize": 21,
@@ -54,7 +53,6 @@ DEFAULT_CFG_VALUES = {
     "tool_label_keywords": ["tool"],
     "tool_label_ids": None,
     "tool_mask_dilate_px": 12,
-    "depth_close_percentile": 90.0,
     "bbox_mode": "internal", # "external" or "internal"
     "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
 }

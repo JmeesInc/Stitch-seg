@@ -1,0 +1,21 @@
+{
+  "name": "TensorRT + Claude",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": [
+    "--gpus=all",
+    "--net=host",
+    "--ipc=host"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-python.python",
+        "nvidia.nvidia-cpp-testing"
+      ]
+    }
+  },
+  "remoteUser": "root",
+  "workspaceFolder": "/workspaces"
+}
