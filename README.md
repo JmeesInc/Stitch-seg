@@ -1,5 +1,5 @@
-## stitch_seg
-
+## stitch-Inferencer
+![image](docs/graphical_abst.png)
 An experimental project for **stitching a temporal sequence of frames into a canvas** and running **segmentation inference on the stitched canvas**, then **warping predictions back to the original frame coordinates**.
 
 `stitch_seg.StitchInferencer` keeps the stitching/state (homographies, canvas, masks, etc.) and calls a user-provided segmentation model (`torch.nn.Module`) on cropped canvas regions.
@@ -7,7 +7,7 @@ An experimental project for **stitching a temporal sequence of frames into a can
 ---
 
 ## Usage
-### Use as a library (minimal example)
+### Use on segmentation
 
 ```python
 from stitch_seg import StitchInferencer
@@ -19,6 +19,20 @@ infer = StitchInferencer(model=seg_model)
 frame_t = torch.zeros(1, 3, 480, 854, device="cuda")  # (1, 3, H, W) float
 infer.step_canvas(frame_t)
 pred = infer.model_inference(frame_shape=(480, 854))   # (C, H, W)
+```
+
+### Use on Tracking
+
+```python
+from stitch_seg import StitchTracker
+import torch
+
+tracker = Mytracker().cuda().eval()
+infer = StitchTracker()
+
+crop_bbox, crop, frame_u = infer.step(frame)
+coords = tracker(crop)
+coords = infer.reproject(coords)
 ```
 
 ---

@@ -23,12 +23,18 @@ from .stitch_utils_torch import (
 
 class StitchTracker(nn.Module):
     """
-    Stateful stitching + motion separation.
-    
-    Minimal implementation focused on canvas creation and coordinate transformation.
-    Tracker should be managed externally by the caller.
+    Stateful stitching + motion separation with simplified 3-step API.
+
+    Usage::
+
+        tracker = StitchTracker2(cfg=cfg)
+
+        for frame in frames:
+            crop_bbox, crop, frame_u = tracker.step(frame)
+            pts_crop = external_tracker.update(crop)
+            pts_current = tracker.reproject(pts_crop)
     """
-    def __init__(self, start_frame=0, cfg=None, canvas_channels=3):
+    def __init__(self, cfg=None, canvas_channels=3):
         super().__init__()
         if cfg is None:
             cfg = build_default_track_cfg()
@@ -36,7 +42,6 @@ class StitchTracker(nn.Module):
             cfg = apply_track_defaults(cfg)
         self.canvas_channels = canvas_channels
         self.cfg = cfg
-        self.start_frame = int(start_frame)
         self.device = cfg.device
         self.roi = None
         self.ellipse_mask = None
@@ -78,6 +83,8 @@ class StitchTracker(nn.Module):
         self.H_cum = torch.eye(3, device=self.device)
         self.last_canvas_bbox = None
         self._first_canvas_corners = None
+        self._last_crop_bbox = None
+        self._last_frame_shape = None
     
     def extract_scope_mask_torch(self, torch_frame: torch.Tensor):
         """
@@ -852,3 +859,75 @@ class StitchTracker(nn.Module):
         new_y2 = float(corners_curr[:, 1].max())
         
         return (int(new_x1), int(new_y1), int(new_x2 - new_x1), int(new_y2 - new_y1))
+
+    # ==================================================================
+    # Simplified 3-step API
+    # ==================================================================
+
+    def step(self, frame, transform="homography"):
+        """
+        Preprocess frame, update canvas, and return crop for tracker input.
+
+        Args:
+            frame: BGR uint8 (H, W, 3) numpy array, or already-preprocessed
+                   (1, 3, H, W) float tensor.
+            transform: "homography" (default) or "tps".
+
+        Returns:
+            crop_bbox: (x1, y1, x2, y2) in canvas coordinates, or None
+            crop: (1, C, H, W) cropped canvas resized to frame dims, or None
+            frame_u: (1, 3, H, W) preprocessed frame tensor
+        """
+        if isinstance(frame, np.ndarray):
+            frame_u = self.preprocess_frame(frame)
+        else:
+            frame_u = frame
+
+        crop_bbox, crop = self.step_canvas(frame_u, transform=transform)
+
+        self._last_crop_bbox = crop_bbox
+        self._last_frame_shape = tuple(frame_u.shape[-2:])
+
+        return crop_bbox, crop, frame_u
+
+    def reproject(self, pts_crop, crop_bbox=None, frame_shape=None):
+        """
+        Transform points from crop coordinates to current frame coordinates.
+        Uses stored crop_bbox/frame_shape from last step() by default.
+
+        Args:
+            pts_crop: (N, 2) points in crop coordinate system (numpy or torch)
+            crop_bbox: override crop_bbox (default: last step's value)
+            frame_shape: override frame_shape (default: last step's value)
+
+        Returns:
+            pts_curr: (N, 2) in current frame coordinates (same type as input)
+        """
+        bbox = crop_bbox if crop_bbox is not None else self._last_crop_bbox
+        shape = frame_shape if frame_shape is not None else self._last_frame_shape
+        if bbox is None or shape is None:
+            raise RuntimeError(
+                "Call step() before reproject(), or provide crop_bbox and frame_shape."
+            )
+        return self.pts_projection(pts_crop, bbox, shape)
+
+    def reproject_bbox(self, bbox_canvas, crop_bbox=None, frame_shape=None):
+        """
+        Transform bounding box from canvas coordinates to current frame coordinates.
+        Uses stored crop_bbox/frame_shape from last step() by default.
+
+        Args:
+            bbox_canvas: (x1, y1, x2, y2) in canvas coordinates
+            crop_bbox: override crop_bbox (default: last step's value)
+            frame_shape: override frame_shape (default: last step's value)
+
+        Returns:
+            (x1, y1, w, h) in current frame coordinates
+        """
+        bbox = crop_bbox if crop_bbox is not None else self._last_crop_bbox
+        shape = frame_shape if frame_shape is not None else self._last_frame_shape
+        if bbox is None or shape is None:
+            raise RuntimeError(
+                "Call step() before reproject_bbox(), or provide crop_bbox and frame_shape."
+            )
+        return self.bbox_projection(bbox_canvas, bbox, shape)
