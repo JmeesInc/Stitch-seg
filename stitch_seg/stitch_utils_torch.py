@@ -244,8 +244,8 @@ def warp_with_transform(img: torch.Tensor, H: torch.Tensor, output_shape=None, i
     padding = 'reflection' if border_mode == 'reflect' else 'zeros' # 'zeros' maps to border_value=0 usually
     if border_mode == 'constant': padding = 'zeros' # kornia doesn't support arbitrary fill value easily in simple warp, defaults 0
     orig_dtype = img.dtype
-    warped = kornia.geometry.transform.warp_perspective(
-        img.float(), H_batch, dsize=(int(out_h), int(out_w)), mode=mode, padding_mode=padding, align_corners=True
+    warped = warp_perspective_safe(
+        img.float(), H_batch, dsize=(int(out_h), int(out_w)), mode=mode, padding_mode=padding
     )
     
     if orig_dtype == torch.uint8:
@@ -275,6 +275,104 @@ def _build_tps_grid(output_shape, input_shape, kernel_centers, kernel_weights, a
     warped = warped.view(batch_size, out_h, out_w, 2)
     grid_norm = kornia.geometry.normalize_pixel_coordinates(warped, in_h, in_w)
     return grid_norm
+
+
+def compute_optical_flow_mask(flow_tensor: torch.Tensor, base_mask: torch.Tensor, cfg):
+    """
+    Calculates statistics and motion mask from a PRE-CALCULATED flow tensor.
+    
+    Arguments:
+        flow_tensor: (B, 2, H, W) torch.Tensor (Previously calculated by NeuFlow/Raft)
+                     This replaces (prev_gray, curr_gray) inputs.
+        base_mask: (H, W) or (B, 1, H, W)
+    """
+    stats = {
+        "valid_ratio": 0.0,
+        "motion_ratio": 1.0,
+        "shift": (0.0, 0.0),
+        "shift_mag": float("inf"),
+        "med_res": 0.0,
+        "res_thresh": 0.0,
+        "med_mag": 0.0,
+        "mag_thresh": 0.0,
+    }
+
+    if flow_tensor is None:
+        # Return dummy assuming shape
+        return None, (0.0, 0.0), None, stats
+
+    # Dimensions
+    B, _, H, W = flow_tensor.shape
+    device = flow_tensor.device
+    
+    dx = flow_tensor[:, 0, ...]
+    dy = flow_tensor[:, 1, ...]
+    mag = torch.sqrt(dx**2 + dy**2)
+
+    # Base Mask Handling
+    if base_mask is not None:
+        if base_mask.dim() == 2:
+            base_mask = base_mask.unsqueeze(0) # (1, H, W)
+        # Assuming base_mask 0 is valid
+        valid_mask = (base_mask == 0)
+    else:
+        valid_mask = torch.ones((B, H, W), dtype=torch.bool, device=device)
+
+    valid_mask &= torch.isfinite(dx) & torch.isfinite(dy)
+    
+    valid_count = valid_mask.sum().item()
+    total_pixels = valid_mask.numel()
+    
+    stats["valid_ratio"] = valid_count / total_pixels if total_pixels > 0 else 0.0
+    
+    if stats["valid_ratio"] < cfg.optflow_min_valid_ratio:
+        return torch.zeros((H, W), dtype=torch.uint8, device=device), (0.0, 0.0), flow_tensor, stats
+
+    # Extract valid values (Flattened)
+    dx_valid = dx[valid_mask]
+    dy_valid = dy[valid_mask]
+    
+    med_dx = dx_valid.median()
+    med_dy = dy_valid.median()
+    
+    # Residuals
+    residual = torch.sqrt((dx - med_dx)**2 + (dy - med_dy)**2)
+    residual_valid = residual[valid_mask]
+    mag_valid = mag[valid_mask]
+    
+    med_res = residual_valid.median()
+    mad_res = (residual_valid - med_res).abs().median() + 1e-6
+    res_thresh = med_res + cfg.optflow_residual_factor * mad_res
+    
+    med_mag = mag_valid.median()
+    mad_mag = (mag_valid - med_mag).abs().median() + 1e-6
+    mag_thresh = med_mag + cfg.optflow_magnitude_factor * mad_mag
+    
+    # Motion Mask Construction
+    raw_mask = (residual > res_thresh) | (mag > mag_thresh) # (B, H, W)
+    
+    # Morphology (Close -> Open)
+    kernel = torch.ones(5, 5, device=device)
+    m_float = raw_mask.float().unsqueeze(1) # (B, 1, H, W)
+    m_closed = kornia.morphology.closing(m_float, kernel)
+    m_opened = kornia.morphology.opening(m_closed, kernel)
+    
+    motion_mask = (m_opened > 0.5).squeeze(1).to(torch.uint8) * 255
+    motion_ratio = (motion_mask > 0).float().mean().item()
+    
+    shift = (med_dx.item(), med_dy.item())
+    
+    stats.update({
+        "motion_ratio": motion_ratio,
+        "shift": shift,
+        "shift_mag": float(np.hypot(shift[0], shift[1])),
+        "med_res": med_res.item(),
+        "res_thresh": res_thresh.item(),
+        "med_mag": med_mag.item(),
+        "mag_thresh": mag_thresh.item(),
+    })
+    
+    return motion_mask.squeeze(0), shift, flow_tensor, stats
 
 
 def filter_features_by_mask(feats: dict, invalid_mask: torch.Tensor) -> dict:
@@ -435,7 +533,7 @@ def paste_current_to_canvas_forward(
             align_corners=True,
         )
     else:
-        warped_packed = kornia.geometry.transform.warp_perspective(
+        warped_packed = warp_perspective_safe(
             packed,
             (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
             dsize=(ch, cw),
@@ -507,11 +605,12 @@ def paste_current_to_canvas_forward(
                 align_corners=True,
             )
         else:
-            warped_grad_alpha = kornia.geometry.transform.warp_perspective(
+            warped_grad_alpha = warp_perspective_safe(
                 grad_alpha,
                 (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
                 dsize=(ch, cw),
-                mode='bilinear' # アルファマップは滑らかにしたいのでbilinear推奨
+                mode='bilinear',
+                padding_mode='zeros',
             )
         blended_alpha = alpha_overlap * warped_grad_alpha
         
@@ -680,7 +779,7 @@ def reset_canvas_orientation(canvas: torch.Tensor, canvas_mask: torch.Tensor, H_
     # 4. Warp
 
     packed = torch.cat([canvas, canvas_mask], dim=1).float()
-    warped_packed = kornia.geometry.transform.warp_perspective(
+    warped_packed = warp_perspective_safe(
         packed, (M.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
     ).to(canvas.dtype)
 
@@ -878,7 +977,7 @@ def paste_current_to_canvas_forward_poisson(
             align_corners=True,
         )
     else:
-        warped_packed = kornia.geometry.transform.warp_perspective(
+        warped_packed = warp_perspective_safe(
             packed,
             (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6),
             dsize=(ch, cw),
@@ -1102,7 +1201,7 @@ def paste_current_to_canvas_forward_multiband(
 
     c_img = img_to_warp.shape[1]
     packed = torch.cat([img_to_warp.float(), mask_b, mask4model_b, rm_b], dim=1)  # (1, C+3, H, W)
-    warped_packed = kornia.geometry.transform.warp_perspective(
+    warped_packed = warp_perspective_safe(
         packed, (H_total.unsqueeze(0) + torch.eye(3, device=device)*1e-6), dsize=(ch, cw), mode='nearest', padding_mode='zeros'
     )
     warped = warped_packed[:, :c_img].to(canvas.dtype)
@@ -1321,4 +1420,136 @@ def paste_current_to_canvas_tps(
         update_mode=update_mode,
         tps_params=tps_params,
     )
+def _inverse_3x3(M: torch.Tensor) -> torch.Tensor:
+    """Analytic 3x3 batch inverse via cofactor expansion (never throws on singular)."""
+    orig_dtype = M.dtype
+    M = M.float()
+    a11, a12, a13 = M[:, 0, 0], M[:, 0, 1], M[:, 0, 2]
+    a21, a22, a23 = M[:, 1, 0], M[:, 1, 1], M[:, 1, 2]
+    a31, a32, a33 = M[:, 2, 0], M[:, 2, 1], M[:, 2, 2]
+    det = (a11 * (a22 * a33 - a23 * a32) -
+           a12 * (a21 * a33 - a23 * a31) +
+           a13 * (a21 * a32 - a22 * a31))
+    inv = torch.stack([
+        torch.stack([a22 * a33 - a23 * a32, a13 * a32 - a12 * a33, a12 * a23 - a13 * a22], dim=-1),
+        torch.stack([a23 * a31 - a21 * a33, a11 * a33 - a13 * a31, a13 * a21 - a11 * a23], dim=-1),
+        torch.stack([a21 * a32 - a22 * a31, a12 * a31 - a11 * a32, a11 * a22 - a12 * a21], dim=-1),
+    ], dim=1)
+    return (inv / det.unsqueeze(-1).unsqueeze(-1)).to(orig_dtype)
 
+
+def _get_pixel_to_normalized_transform(H: int, W: int, device, dtype):
+    T = torch.eye(3, device=device, dtype=dtype).unsqueeze(0)
+    T[:, 0, 0] = 2.0 / (W - 1)
+    T[:, 0, 2] = -1.0
+    T[:, 1, 1] = 2.0 / (H - 1)
+    T[:, 1, 2] = -1.0
+    return T
+
+
+def _normalize_homography(M, src_size, dst_size):
+    B = M.shape[0]
+    H_src, W_src = src_size
+    H_dst, W_dst = dst_size
+    N_src = _get_pixel_to_normalized_transform(H_src, W_src, M.device, M.dtype)
+    N_dst = _get_pixel_to_normalized_transform(H_dst, W_dst, M.device, M.dtype)
+    N_src_inv = _inverse_3x3(N_src.expand(B, -1, -1))
+    return torch.matmul(torch.matmul(N_dst, M), N_src_inv)
+
+
+def warp_perspective_safe(src, M, dsize, mode='nearest', padding_mode='zeros'):
+    """warp_perspective that uses analytic 3x3 inverse instead of torch.linalg.inv."""
+    B, _, H, W = src.size()
+    h_out, w_out = dsize
+    dst_norm_trans_src_norm = _normalize_homography(M, (H, W), (h_out, w_out))
+    src_norm_trans_dst_norm = _inverse_3x3(dst_norm_trans_src_norm)
+    xs = torch.linspace(-1, 1, w_out, device=src.device, dtype=src.dtype)
+    ys = torch.linspace(-1, 1, h_out, device=src.device, dtype=src.dtype)
+    gy, gx = torch.meshgrid(ys, xs, indexing='ij')
+    grid = torch.stack([gx, gy], dim=-1).unsqueeze(0).expand(B, h_out, w_out, 2)
+    # transform grid
+    pts_h = torch.cat([grid, torch.ones(B, h_out, w_out, 1, device=src.device, dtype=src.dtype)], dim=-1)
+    pts_flat = pts_h.view(B, -1, 3)
+    out_flat = torch.matmul(pts_flat, src_norm_trans_dst_norm.transpose(1, 2))
+    z = out_flat[..., 2:3].clamp(min=1e-8)
+    xy = out_flat[..., 0:2] / z
+    grid_out = xy.view(B, h_out, w_out, 2)
+    return F.grid_sample(src, grid_out, align_corners=True, mode=mode, padding_mode=padding_mode)
+
+import re
+
+import cv2
+import numpy as np
+
+
+# maskからcontourを抽出し、各contourの中心点を返す
+def mask2centers(mask: np.ndarray) -> np.ndarray:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # boxの中心点がground truthとして使われている
+    boxes = np.array([cv2.boundingRect(contour) for contour in contours])
+    points = boxes[:, :2] + boxes[:, 2:] / 2
+    return points
+    # points = np.array([np.mean(contour, axis=0) for contour in contours])
+    # return points.reshape(-1, 2)
+
+
+# maskのpixelを全て(x, y)の形式で返す
+def mask2points(mask: np.ndarray) -> np.ndarray:
+    mask_queries = np.where(mask > 0)
+    mask_queries = np.vstack((mask_queries[1], mask_queries[0])).T
+    return mask_queries
+# maskからcontourを抽出し、各contourの外接矩形にマージン分大きくした長方形を返す
+# (x, y, w, h)の形式
+def mask2boxes(mask: np.ndarray, margin: int = 0) -> np.ndarray:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    boxes = np.array([cv2.boundingRect(contour) for contour in contours])
+    boxes[:, 0] -= margin
+    boxes[:, 1] -= margin
+    boxes[:, 0] = np.maximum(boxes[:, 0], 0)
+    boxes[:, 1] = np.maximum(boxes[:, 1], 0)
+    boxes[:, 2] += margin * 2
+    boxes[:, 3] += margin * 2
+    boxes[:, 2] = np.minimum(boxes[:, 2], mask.shape[1] - boxes[:, 0])
+    boxes[:, 3] = np.minimum(boxes[:, 3], mask.shape[0] - boxes[:, 1])
+    return boxes
+
+
+def draw_points(
+    image: np.ndarray,
+    points: np.ndarray,
+    color: tuple[int, int, int] = (0, 0, 255),
+    radius: int = 11,
+) -> np.ndarray:
+    for point in points:
+        image = cv2.circle(image, tuple(map(int, point)), radius, color, -1)
+    return image
+
+
+def draw_boxes(
+    image: np.ndarray, boxes: np.ndarray, color: tuple[int, int, int] = (0, 255, 0)
+) -> np.ndarray:
+    for box in boxes:
+        image = cv2.rectangle(
+            image, (box[0], box[1]), (box[0] + box[2], box[1] + box[3]), color, 2
+        )
+    return image
+
+def getcentersfromseg(im_seg):
+    """Grabs contour centers from a full resolution segmentation image.
+    returns half-res center locations ***important to rescale image to display on
+    Returns:
+        centers: [[x, y], [x2, y2], ..., [xn, yn]] list of centers"""
+    contours, hierarchy = cv2.findContours(
+        im_seg, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    if len(contours) == 0:
+        return []
+        #raise IndexError(f"No contours were found in in image")
+    centers = []  # set of bounding rectangle centers
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        xcent = x + w // 2
+        ycent = y + h // 2
+        centers.append([xcent, ycent])
+    return np.array(centers)
