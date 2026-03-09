@@ -49,3 +49,22 @@ def load_masking_model2(cfg):
     seg_model.load_state_dict(state, strict=True)
     seg_model.eval()
     return seg_model
+
+def motion_mask(flow: torch.Tensor) -> torch.Tensor:
+    """
+    input: flow (1, 1, 2, H, W)
+    output: motion_mask (H, W) uint8, 0 or 255
+    
+    optical flowから動いている部分のマスクを推定する
+    """
+    dx = flow[:, 0, 0, ...]
+    dy = flow[:, 0, 1, ...]
+    median_dx = dx.median()
+    median_dy = dy.median()
+    rel_dx, rel_dy = dx - median_dx, dy - median_dy
+    magnitude = torch.sqrt(rel_dx**2 + rel_dy**2)
+    mean_mag = torch.mean(magnitude)
+    std_mag = torch.std(magnitude)
+    mag_thresh = mean_mag + 3 * std_mag
+    motion_mask = (magnitude > mag_thresh).to(torch.uint8) * 255
+    return motion_mask
