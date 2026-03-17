@@ -1,17 +1,22 @@
 ## stitch-Inferencer
 ![image](docs/graphical_abst.png)
-An experimental project for **stitching a temporal sequence of frames into a canvas** and running **segmentation inference on the stitched canvas**, then **warping predictions back to the original frame coordinates**.
+An experimental project for **1. stitching a temporal sequence of frames into a canvas**, and **2. running inference on the stitched canvas**, then **3. warping predictions back to the original frame coordinates**.
 
 `stitch_seg.StitchInferencer` keeps the stitching/state (homographies, canvas, masks, etc.) and calls a user-provided segmentation model (`torch.nn.Module`) on cropped canvas regions.
 
 ---
 
 ## Usage
-### Use on segmentation
+### Environment setup
 
+```bash
+uv venv
+uv sync
+source .venv/bin/activate
+```
+### Use on segmentation
 ```python
 from stitch_seg import StitchInferencer
-import torch
 
 seg_model = MySegModel().cuda().eval() # Assume input is 0~255 tensor, please define preprocess pipeline at MySegmodel.forward()
 inferencer = StitchInferencer(model=seg_model)
@@ -25,6 +30,50 @@ while True:
     pred = inferencer(frame_torch)
     
 ```
+Here is how to prepare preprocess pipeline to segmentation model
+```python
+class MySegModel(nn.Module):
+    def __init__(self):
+        self.model = smp.Unet("tu-convnext_base", classes=13) # example, which assumes img / 255.0 as input
+        self.model.load_state_dict(torch.load("weights/last.pt", map_location="cuda"), strict=True)
+        self.model.eval()
+        self.mean = torch.tensor([0.485, 0.456, 0.406]).view(-1, 1, 1)
+        self.std = torch.tensor([0.229, 0.224, 0.225]).view(-1, 1, 1)
+
+    def _prepare_input(self, img_tensor: torch.Tensor):
+        img_tensor = img_tensor.float() / 255.0
+        # If needed
+        # img_tensor = (img_tensor - mean) / std
+        return img_tensor
+
+    def _predict_to_shape(self, tensor: torch.Tensor, target_hw) -> torch.Tensor:
+        pred = self.model(tensor)
+        pred_resized = F.interpolate(
+            pred, 
+            size=target_hw, 
+            mode='bilinear', 
+            align_corners=False
+        )
+        return pred_resized
+
+    def forward(self, canvas: torch.Tensor) -> torch.Tensor:
+        input_tensor = self._prepare_input(canvas)
+        target_hw = canvas.shape[-2:]
+        output = self._predict_to_shape(input_tensor, target_hw)  
+        return output
+```
+If you want to predict only on certain frames:
+```python
+while True:
+    ret, frame_np = cap.read()
+    if not ret:
+        break
+    frame_torch = inferencer.preprocess_frame(frame_np)
+    inferencer.step_canvas(frame_torch)
+    if predict:
+        pred = self.model_inference()
+```
+
 
 ### Use on Tracking
 
@@ -42,26 +91,8 @@ coords = infer.reproject(coords)
 
 ---
 
-## Features
-
-- **Canvas stitching**: sequentially paste frames onto a canvas while tracking cumulative transforms
-- **Tool masking**: generate a tool mask using a pre-trained tool detector to suppress invalid regions
-- **Segmentation on canvas**: crop the canvas region relevant to the current frame and run the segmentation model
-- **Warp back to frame**: return the prediction warped to the current frame as `(C, H, W)`
-
----
-
-## Requirements
-
-- **Python**: `>= 3.9, <= 3.13`
-- **PyTorch**: CUDA 12.6 wheels (configured via `uv` in `pyproject.toml`)
-- **TensorRT**: `>= 10.15` (included in the DevContainer; required for TRT engine export and inference)
-- **NVIDIA Driver**: CUDA driver API version **13.0** or later is required (corresponds to NVIDIA Display Driver **≥ 570**). Older drivers will fail to load the TensorRT container or run CUDA 12.x kernels.
-
----
-
 ## DevContainer Setup
-
+You can reproduce TensorRT implementation on this container.
 A `.devcontainer` configuration is provided for VS Code / GitHub Codespaces.
 
 **Base image**: `nvcr.io/nvidia/tensorrt:26.01-py3`
