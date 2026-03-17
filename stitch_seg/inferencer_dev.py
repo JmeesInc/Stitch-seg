@@ -1,13 +1,10 @@
 import cv2
-from kornia.filters.blur_pool import blur_pool2d
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 import kornia
 import kornia.augmentation as K
-import time
-import matplotlib.pyplot as plt
 from typing import Optional, Tuple
 
 from .models import (
@@ -19,7 +16,6 @@ from .config import apply_stitch_defaults, build_default_cfg
 from .stitch_utils_torch import (
     compute_static_roi,
     equalize_hist_rgb,
-    merge_masks,
     warp_with_transform,
     filter_features_by_mask,
     paste_current_to_canvas_forward,

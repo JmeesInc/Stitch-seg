@@ -1,13 +1,11 @@
 import cv2
-from kornia.filters.blur_pool import blur_pool2d
 import numpy as np
 import torch
 import torch.nn as nn
 from tqdm import tqdm
 import kornia
 import kornia.augmentation as K
-import time
-import matplotlib.pyplot as plt
+from typing import Optional, Tuple
 
 from .models import (
     load_masking_model,
@@ -18,7 +16,6 @@ from .config import apply_stitch_defaults, build_default_cfg
 from .stitch_utils_torch import (
     compute_static_roi,
     equalize_hist_rgb,
-    merge_masks,
     warp_with_transform,
     filter_features_by_mask,
     paste_current_to_canvas_forward,
@@ -46,23 +43,39 @@ class StitchInferencer(nn.Module):
          into the current frame space.
     """
 
-    def __init__(self, model, cfg=None, start_frame: int=0, canvas_channels: int=3):
+    def __init__(
+        self,
+        model,
+        cfg=None,
+        input_size: Tuple[int, int] = (480, 854),
+        start_frame: int = 0,
+        canvas_channels: int = 3,
+        auto_reset_on_shape_change: bool = True,
+    ):
         super().__init__()
         if cfg is None:
             cfg = build_default_cfg()
         else:
             cfg = apply_stitch_defaults(cfg)
-        self.canvas_channels = canvas_channels
         self.model = model
         self.cfg = cfg
+        self.input_size = tuple(int(v) for v in input_size)
         self.start_frame = int(start_frame)
+        self.canvas_channels = int(canvas_channels)
+        self.auto_reset_on_shape_change = bool(auto_reset_on_shape_change)
         self.device = cfg.device
         self.roi = None
         self.ellipse_mask = None
         self.use_roi = bool(getattr(cfg, "use_static_roi", True))
-        self.roi = None
         self.apply_ellipse_mask = bool(getattr(cfg, "apply_ellipse_mask", True))
         self.equalize_hist = bool(getattr(cfg, "equalize_hist_rgb", True))
+        self.num_classes = int(getattr(cfg, "num_classes", 1))
+        self.output_mode = str(getattr(cfg, "output_mode", "logits")).lower()
+        if self.output_mode not in {"logits", "sigmoid", "softmax"}:
+            raise ValueError(
+                f"Unsupported cfg.output_mode={self.output_mode!r}. "
+                "Expected one of: 'logits', 'sigmoid', 'softmax'."
+            )
 
         self.masking_model = load_masking_model(cfg)
         self.masking_model2 = load_masking_model2(cfg)
@@ -76,23 +89,142 @@ class StitchInferencer(nn.Module):
         self.last_model_input = None
         self.last_model_output = None
         self.last_tool_mask = None
+        self.last_frame_shape: Optional[Tuple[int, int]] = None
+        self.canvas_h = None
+        self.canvas_w = None
+
+        self._set_canvas_geometry(self.input_size)
 
         self.reset_state()
 
-    def reset_state(self):
+    def _set_canvas_geometry(self, frame_shape: Tuple[int, int]):
+        h0, w0 = (int(frame_shape[0]), int(frame_shape[1]))
+        self.input_size = (h0, w0)
+        self.canvas_h = int(self.cfg.canvas_scale_y * h0 * self.cfg.canvas_superres_scale)
+        self.canvas_w = int(self.cfg.canvas_scale_x * w0 * self.cfg.canvas_superres_scale)
+        scale = float(getattr(self.cfg, "canvas_superres_scale", 1.0))
+        base_cw = int(self.canvas_w / scale) if scale > 0 else self.canvas_w
+        base_ch = int(self.canvas_h / scale) if scale > 0 else self.canvas_h
+        self.offset_xy = (base_cw // 2 - w0 // 2, base_ch // 2 - h0 // 2)
+
+    def reset_state(self, clear_preprocess_state: bool = False):
         self.canvas = None # for model inference
         self.canvas_memory = None # for step and update canvas
         self.canvas_mask = None # for model inference
         self.canvas_mask_memory = None # for step and update canvas
         self.canvas4model = None
-        self.canvas_mask4model = None
-        self.offset_xy = (0, 0)
+        self.canvas4model_mask = None
         self.prev_rgb_raw = None
         self.prev_feats = None
+        self.combined_mask_prev_raw = None
         self.prev_stab_transform = torch.eye(3, device=self.device)
         self.H_cum = torch.eye(3, device=self.device)
         self.last_canvas_crop = None
         self.last_canvas_bbox = None
+        self.last_model_input = None
+        self.last_model_output = None
+        self.last_tool_mask = None
+        self.last_frame_shape = None
+        if clear_preprocess_state:
+            self.roi = None
+            self.ellipse_mask = None
+
+    def _empty_prediction(self, frame_shape: Tuple[int, int]) -> torch.Tensor:
+        h, w = int(frame_shape[0]), int(frame_shape[1])
+        return torch.zeros((self.num_classes, h, w), dtype=torch.float32, device=self.device)
+
+    def _mask_to_bool(self, mask: Optional[torch.Tensor], target_hw: Tuple[int, int]) -> Optional[torch.Tensor]:
+        if mask is None:
+            return None
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.dim() == 3:
+            if mask.shape[0] == 1:
+                mask = mask.unsqueeze(1)
+            else:
+                mask = mask.unsqueeze(0)
+        elif mask.dim() != 4:
+            raise ValueError(f"mask must be 2D/3D/4D, got shape {tuple(mask.shape)}")
+        if tuple(mask.shape[-2:]) != tuple(target_hw):
+            mask = torch.nn.functional.interpolate(mask.float(), size=target_hw, mode="nearest")
+        return mask[:, :1].to(self.device).float() > 0.5
+
+    def _apply_binary_channel_override(self, pred: torch.Tensor, channel_idx: int, mask_bool: torch.Tensor):
+        if pred.shape[1] == 0 or not (0 <= channel_idx < pred.shape[1]):
+            return pred
+        mask_2d = mask_bool[:, 0]
+        channel = pred[:, channel_idx, :, :]
+        if self.output_mode == "logits":
+            pred[:, channel_idx, :, :] = mask_2d.float() * 255.0
+        else:
+            pred[:, channel_idx, :, :] = torch.where(mask_2d, torch.ones_like(channel), channel)
+        return pred
+
+    def _apply_softmax_channel_override(self, pred: torch.Tensor, channel_idx: int, mask_bool: torch.Tensor):
+        if pred.shape[1] == 0 or not (0 <= channel_idx < pred.shape[1]):
+            return pred
+        if self.output_mode != "softmax":
+            return self._apply_binary_channel_override(pred, channel_idx, mask_bool)
+        mask_full = mask_bool.expand(-1, pred.shape[1], -1, -1)
+        pred = torch.where(mask_full, torch.zeros_like(pred), pred)
+        pred[:, channel_idx, :, :] = torch.where(
+            mask_bool[:, 0],
+            torch.ones_like(pred[:, channel_idx, :, :]),
+            pred[:, channel_idx, :, :],
+        )
+        return pred
+
+    def _apply_output_overrides(
+        self,
+        pred: torch.Tensor,
+        frame_shape: Tuple[int, int],
+        ellipse_mask: Optional[torch.Tensor] = None,
+        tool_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        ellipse_bool = self._mask_to_bool(ellipse_mask, frame_shape)
+        if self.apply_ellipse_mask and ellipse_bool is not None:
+            if self.output_mode == "softmax":
+                pred = self._apply_softmax_channel_override(pred, 0, ellipse_bool)
+            else:
+                pred = self._apply_binary_channel_override(pred, 0, ellipse_bool)
+
+        if self.cfg.tool_class_ch is not None and getattr(self.cfg, "num_classes", 0) > 1:
+            tool_bool = self._mask_to_bool(tool_mask, frame_shape)
+            if tool_bool is not None:
+                ch = int(self.cfg.tool_class_ch)
+                if self.output_mode == "softmax":
+                    pred = self._apply_softmax_channel_override(pred, ch, tool_bool)
+                else:
+                    pred = self._apply_binary_channel_override(pred, ch, tool_bool)
+        return pred
+
+    def _ensure_ellipse_mask(self, frame_u: torch.Tensor):
+        if not self.apply_ellipse_mask:
+            return
+        if self.ellipse_mask is None or tuple(self.ellipse_mask.shape[-2:]) != tuple(frame_u.shape[-2:]):
+            self.extract_scope_mask(frame_u)
+
+    def _prepare_runtime_state(self, frame_u: torch.Tensor):
+        if frame_u is None:
+            raise ValueError("frame_u must not be None")
+        if frame_u.dim() == 3:
+            frame_u = frame_u.unsqueeze(0)
+        if frame_u.dim() != 4:
+            raise ValueError(f"frame_u must be 4D (B,C,H,W), got {tuple(frame_u.shape)}")
+        frame_shape = tuple(int(v) for v in frame_u.shape[-2:])
+        if self.last_frame_shape is not None and frame_shape != self.last_frame_shape:
+            if self.auto_reset_on_shape_change:
+                self.reset_state(clear_preprocess_state=False)
+            elif self.canvas4model is not None:
+                raise ValueError(
+                    f"frame shape changed from {self.last_frame_shape} to {frame_shape} "
+                    "while auto_reset_on_shape_change is disabled"
+                )
+        if frame_shape != self.input_size or self.canvas_h is None or self.canvas_w is None:
+            self._set_canvas_geometry(frame_shape)
+        self._ensure_ellipse_mask(frame_u)
+        self.last_frame_shape = frame_shape
+        return frame_u
     
     def extract_scope_mask_torch(self, torch_frame: torch.Tensor):
         """
@@ -323,6 +455,9 @@ class StitchInferencer(nn.Module):
 
                         if not changed:
                             break
+        elif mode == "entire":
+            x1, y1 = 0, 0
+            x2, y2 = self.canvas4model.shape[-1], self.canvas4model.shape[-2]
         elif mode == "external":
             if self.canvas4model_mask is None:
                 x1, y1, x2, y2 = _original_bbox()
@@ -349,21 +484,27 @@ class StitchInferencer(nn.Module):
         return x1, y1, x2, y2
     
     @torch.inference_mode()
-    def model_inference(self, frame_shape) -> torch.Tensor:
+    def model_inference(self, frame_shape=None) -> torch.Tensor:
         """
         Returns: Seg Map Tensor (Classes, H, W)
         """
+        if frame_shape is None:
+            frame_shape = self.last_frame_shape
+        if frame_shape is None:
+            return None
+
         source_canvas = self.canvas4model
         if self.model is None or source_canvas is None:
             return None
             
         x1, y1, x2, y2 = self._current_canvas_bbox(frame_shape)
         if x1 is None or y1 is None or x2 is None or y2 is None:
-            self.reset_state()
-            return torch.zeros((1, self.cfg.num_classes, frame_shape[0], frame_shape[1]), dtype=torch.float32, device=self.device)
+            self.reset_state(clear_preprocess_state=False)
+            return self._empty_prediction(frame_shape)
 
         crop = source_canvas[..., y1:y2, x1:x2]
-        if crop.numel() == 0: return None
+        if crop.numel() == 0:
+            return self._empty_prediction(frame_shape)
         
         # Model Inference (crop is (1, 3, Hc, Wc))
         # self.model expects (B, 3, H, W)
@@ -388,35 +529,22 @@ class StitchInferencer(nn.Module):
         H = self._current_to_canvas_h()
         try:
             H_canvas_to_curr = torch.linalg.inv(H)
-        except Exception as e:
-            self.reset_state()
-            return torch.zeros((1, self.cfg.num_classes, frame_shape[0], frame_shape[1]), dtype=torch.float32, device=self.device)
+        except Exception:
+            self.reset_state(clear_preprocess_state=False)
+            return self._empty_prediction(frame_shape)
         # Warp (1, Classes, H_canv, W_canv) -> (1, Classes, H, W)
         warped_pred = warp_with_transform(canvas_pred, H_canvas_to_curr, (h, w), interpolation='nearest', border_mode='zeros')
-
-        if self.cfg.apply_ellipse_mask:  # ellipse maskの1の部分は0にする
-            # NOTE: `self.ellipse_mask` can be computed on a different resolution
-            # (e.g., before ROI crop or when input sizes change). Always resize to
-            # the current output shape to avoid shape mismatch crashes.
-            if self.ellipse_mask is not None:
-                ellipse = self.ellipse_mask
-                if ellipse.dim() == 3:
-                    ellipse = ellipse.unsqueeze(0)  # (1,1,H,W) expected
-                if ellipse.shape[-2:] != (h, w):
-                    ellipse = torch.nn.functional.interpolate(
-                        ellipse.float(), size=(h, w), mode="nearest"
-                    )
-                warped_pred[:, 0, :, :] = ellipse.squeeze(0).float() * 255.0
-        # Optionally inject tool mask into a dedicated class channel.
-        # IMPORTANT: For binary segmentation (num_classes=1), injecting would overwrite the only channel
-        # and make downstream visualizations look like "tool segmentation".
-        if self.cfg.tool_class_ch is not None and getattr(self.cfg, "num_classes", 0) > 1:
-            if self.last_tool_mask is not None and 0 <= int(self.cfg.tool_class_ch) < warped_pred.shape[1]:
-                warped_pred[:, int(self.cfg.tool_class_ch), :, :] = self.last_tool_mask.squeeze(0).float()
+        warped_pred = self._apply_output_overrides(
+            warped_pred,
+            frame_shape=(h, w),
+            ellipse_mask=self.ellipse_mask,
+            tool_mask=self.last_tool_mask,
+        )
         return warped_pred.squeeze(0) # (Classes, H, W)
     
     def first_frame(self, frame_u, tool_mask_raw, current_img=None):
         if self.canvas4model is None:
+            frame_u = self._prepare_runtime_state(frame_u)
             # `current_img` is what gets pasted into the canvas.
             # - For normal stitching: current_img = frame_u (RGB, 3ch)
             # - For pred stitching: current_img = pred (Classes, Cch)
@@ -427,24 +555,11 @@ class StitchInferencer(nn.Module):
             if current_img.dim() != 4:
                 raise ValueError(f"current_img must be 4D (B,C,H,W), got {tuple(current_img.shape)}")
             if int(current_img.shape[1]) != int(self.canvas_channels):
-                raise ValueError(
-                    f"canvas_channels mismatch: canvas_channels={self.canvas_channels} "
-                    f"but current_img has C={int(current_img.shape[1])}. "
-                    f"Pass canvas_channels matching the tensor you want to stitch."
-                )
-            _, _, h0, w0 = frame_u.shape
-            self.canvas_h = int(self.cfg.canvas_scale_y * h0 * self.cfg.canvas_superres_scale)
-            self.canvas_w = int(self.cfg.canvas_scale_x * w0 * self.cfg.canvas_superres_scale)
+                self.canvas_channels = int(current_img.shape[1])
             self.canvas4model = torch.zeros((1, self.canvas_channels, self.canvas_h, self.canvas_w), dtype=torch.float32, device=self.device)
             self.canvas4model_mask = torch.zeros((1, 1, self.canvas_h, self.canvas_w), dtype=torch.uint8, device=self.device)
             self.canvas = self.canvas4model.clone()
             self.canvas_mask = self.canvas4model_mask.clone()
-            # Correct offset calculation based on UN-scaled dimensions
-            # canvas_w is scaled, so divide by scale first
-            scale = getattr(self.cfg, "canvas_superres_scale", 1.0)
-            base_cw = int(self.canvas_w / scale) if scale > 0 else self.canvas_w
-            base_ch = int(self.canvas_h / scale) if scale > 0 else self.canvas_h
-            self.offset_xy = (base_cw // 2 - w0 // 2, base_ch // 2 - h0 // 2)
 
             self.prev_rgb_raw = frame_u.clone()
             self.prev_stab_transform = torch.eye(3, device=self.device)
@@ -478,6 +593,7 @@ class StitchInferencer(nn.Module):
         frame_u: (1, 3, H, W) RGB Float
         transform: "homography" (default) or "tps"
         """
+        frame_u = self._prepare_runtime_state(frame_u)
         with torch.autocast(device_type=self.device.type, dtype=torch.float16):
             transform_mode = str(transform).lower() if transform is not None else "homography"
             use_tps = transform_mode == "tps"
@@ -521,8 +637,8 @@ class StitchInferencer(nn.Module):
                     # T_curr @ p_curr = H_rel @ p_prev
                     # p_prev = inv(H_rel) @ T_curr @ p_curr
                     #H_cum_curr = self.H_cum @ torch.linalg.inv(H_rel_t)
-                if isinstance(H_inv, tuple):
-                    self.reset_state()
+                if H_inv is None:
+                    self.reset_state(clear_preprocess_state=False)
                     self.first_frame(frame_u, tool_mask_raw)
                     return
                 H_cum_curr = self.H_cum @ H_inv
@@ -692,13 +808,9 @@ class StitchInferencer(nn.Module):
         - H_rel: 推定されたホモグラフィ (3x3) Tensor または None
         """
         H_rel = None
-        inliers = 0
-        pts_prev = None
-        pts_curr = None
-        inlier_mask = None
 
         if prev_feats is None or curr_feats is None:
-            return H_rel, inliers, pts_prev, pts_curr, inlier_mask
+            return H_rel
 
         # Matcher実行 (GPU)
         with torch.inference_mode():
@@ -706,6 +818,8 @@ class StitchInferencer(nn.Module):
         
         matches = result.get("matches") # (M, 2)
         scores = result.get("scores")
+        if matches is None or scores is None:
+            return H_rel
 
         # LightGlueはバッチ対応していますが、ここではBatch=0のみ取得する前提
         # matchesは (M, 2) のTensor
@@ -713,7 +827,7 @@ class StitchInferencer(nn.Module):
 
         # 最小マッチ数チェック (DLTには最低4点必要)
         if match_idx.shape[0] < max(min_matches, 4):
-            return H_rel, inliers, pts_prev, pts_curr, inlier_mask
+            return H_rel
 
         # ポイント抽出 (GPU上のTensorのまま)
         # prev_feats["keypoints"] is typically (B, N, 2) -> take batch 0
@@ -788,6 +902,10 @@ class StitchInferencer(nn.Module):
         frame_u: (1, 3, H, W) RGB Float
         transform: "homography" (default) or "tps"
         """
+        frame_u = self._prepare_runtime_state(frame_u)
+        pred_b = pred
+        if pred_b is not None and pred_b.dim() == 3:
+            pred_b = pred_b.unsqueeze(0)
         with torch.autocast(device_type=self.device.type, dtype=torch.float16):
             transform_mode = str(transform).lower() if transform is not None else "homography"
             use_tps = transform_mode == "tps"
@@ -797,11 +915,8 @@ class StitchInferencer(nn.Module):
             # === 2. Convert to Grayscale for Flow ===
             # === 3. Initialization ===
             if self.canvas4model is None:
-                pred_b = pred
                 if pred_b is None:
                     return None
-                if pred_b.dim() == 3:
-                    pred_b = pred_b.unsqueeze(0)
                 # Initialize canvas in "prediction space" (C = num_classes)
                 self.first_frame(frame_u, tool_mask_raw, current_img=pred_b)
                 # Return stitched prediction in the current frame space
@@ -838,10 +953,12 @@ class StitchInferencer(nn.Module):
                     # T_curr @ p_curr = H_rel @ p_prev
                     # p_prev = inv(H_rel) @ T_curr @ p_curr
                     #H_cum_curr = self.H_cum @ torch.linalg.inv(H_rel_t)
-                if isinstance(H_inv, tuple):
-                    self.reset_state()
-                    self.first_frame(frame_u, tool_mask_raw)
-                    return
+                if H_inv is None:
+                    self.reset_state(clear_preprocess_state=False)
+                    if pred_b is None:
+                        return None
+                    self.first_frame(frame_u, tool_mask_raw, current_img=pred_b)
+                    return self._warp_canvas_pred_to_current(frame_u.shape[-2:], H_cum=self.H_cum, tool_mask=tool_mask_raw)
                 H_cum_curr = self.H_cum @ H_inv
 
             if use_tps and curr_feats is not None and self.prev_feats is not None:
@@ -948,27 +1065,16 @@ class StitchInferencer(nn.Module):
             return None
 
         warped_pred = warp_with_transform(self.canvas4model.to(torch.float32), H_canvas_to_curr, (h, w), interpolation='nearest', border_mode='zeros')
-
-        # Keep behavior consistent with `model_inference()`
-        if self.cfg.apply_ellipse_mask and self.ellipse_mask is not None:
-            ellipse = self.ellipse_mask
-            if ellipse.dim() == 3:
-                ellipse = ellipse.unsqueeze(0)
-            if ellipse.shape[-2:] != (h, w):
-                ellipse = torch.nn.functional.interpolate(ellipse.float(), size=(h, w), mode="nearest")
-            if warped_pred.shape[1] > 0:
-                warped_pred[:, 0, :, :] = ellipse.squeeze(0).float() * 255.0
-
-        if self.cfg.tool_class_ch is not None and getattr(self.cfg, "num_classes", 0) > 1:
-            # Prefer the latest tool mask if provided
-            if tool_mask is not None:
-                tm = tool_mask
-                if tm.dim() == 4:
-                    tm = tm[:, 0]  # (1,H,W)
-                if tm.dim() == 3 and tm.shape[0] == 1:
-                    tm = tm.squeeze(0)  # (H,W)
-                tm = tm.to(self.device).to(torch.float32)
-                ch = int(self.cfg.tool_class_ch)
-                if 0 <= ch < warped_pred.shape[1]:
-                    warped_pred[:, ch, :, :] = tm
+        warped_pred = self._apply_output_overrides(
+            warped_pred,
+            frame_shape=(h, w),
+            ellipse_mask=self.ellipse_mask,
+            tool_mask=tool_mask,
+        )
         return warped_pred.squeeze(0)
+
+    @torch.inference_mode()
+    def forward(self, frame_u: torch.Tensor, transform: str = "homography") -> torch.Tensor:
+        frame_u = self._prepare_runtime_state(frame_u)
+        self.step_canvas(frame_u, transform=transform)
+        return self.model_inference(frame_shape=frame_u.shape[-2:])
