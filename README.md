@@ -331,8 +331,8 @@ CC BY-NC-SA 4.0
 
 This project depends on / is inspired by:
 
-- LightGlue / ALIKED (alikked-tensorrt, LightGlue-ONNX as well)
-- segmentation-models-pytorch
+- [LightGlue](https://github.com/cvg/LightGlue) / [ALIKED](https://github.com/Shiaoming/ALIKED) ([alikked-tensorrt](https://github.com/ajuric/aliked-tensorrt), [LightGlue-ONNX](https://github.com/fabio-sim/LightGlue-ONNX) as well)
+- [segmentation-models-pytorch](https://github.com/qubvel-org/segmentation_models.pytorch)
 
 Please Cite Our Work in your research:
 ```
