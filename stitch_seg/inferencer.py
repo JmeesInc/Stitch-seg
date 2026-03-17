@@ -46,7 +46,7 @@ class StitchInferencer(nn.Module):
          into the current frame space.
     """
 
-    def __init__(self, model, start_frame: int, cfg=None, canvas_channels=3):
+    def __init__(self, model, cfg=None, start_frame: int=0, canvas_channels: int=3):
         super().__init__()
         if cfg is None:
             cfg = build_default_cfg()

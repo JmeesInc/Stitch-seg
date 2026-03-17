@@ -2,7 +2,8 @@ import torch
 
 
 DEFAULT_CFG_VALUES = {
-    "tool_class_ch": 0,
+    "output_mode": "logits",
+    "tool_class_ch": None,
     "enable_depth_mask": False,
     "enable_flow_translation": False,
     "enable_motion_mask": False,

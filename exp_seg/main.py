@@ -13,7 +13,7 @@ import segmentation_models_pytorch as smp
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 
-from stitch_seg import StitchInferencer
+from stitch_seg import StitchInferencerDev as StitchInferencer
 import time
 import cProfile
 import pstats
@@ -23,25 +23,26 @@ from .exp.model import UnetPlusPlus
 class CFG:
     #video_path = "/mnt/devices/dl2/ex-data-2/data11/share/TLH/standardized_videos/001510725.mp4"
     video_path = "video01.mp4"
-    start_frame = 28000
-    end_frame = 29000
+    start_frame = 29000
+    end_frame = 30000
     enable_depth_mask = False
     output_dir = "1217_test"
     method = "pyramid"
     bbox_mode = "internal"
     apply_ellipse_mask = True
+    output_mode = "logits"
     laplacian_var_min = 60
-    segmentation_weights = "/mnt/devices/dl1/in-data/data4/result/Hysterectomy/Ureter/v10.0/cv1/last.pth"
-    num_classes = 1
+    alpha_overlap = 0.7
+    segmentation_weights = "models/unetpp/fold0.pth"
+    num_classes = 13
+    backbone = "tu-convnext_base"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    # NOTE:
-    # `StitchInferencer.model_inference()` can optionally inject tool mask into a class channel.
-    # For binary segmentation (num_classes=1), set this to None to avoid overwriting the only channel.
+    # Set this only if a dedicated tool class channel exists in the segmentation model.
     tool_class_ch = None
 
-    debug = False
+    debug = True
     debug_dir = "0114_check"
-    debug_video_filename = "internal.mp4"
+    debug_video_filename = "unetpp_stitch.mp4"
 
 class CanvasSegModel(nn.Module):
     def __init__(self, cfg):
@@ -104,6 +105,35 @@ class CanvasSegModel(nn.Module):
         return output, self.last_model_input_image
 
 
+def _resolve_output_mode(output_mode: Optional[str] = None) -> str:
+    mode = str(output_mode or getattr(CFG, "output_mode", "logits")).lower()
+    if mode not in {"logits", "sigmoid", "softmax"}:
+        raise ValueError(f"Unsupported output_mode={mode!r}")
+    return mode
+
+
+def prediction_to_prob(mask, output_mode: Optional[str] = None):
+    if mask is None:
+        return None
+    mode = _resolve_output_mode(output_mode)
+    if isinstance(mask, torch.Tensor):
+        pred = mask.detach().float()
+        if mode == "logits":
+            if pred.dim() >= 3 and pred.shape[-3] > 1:
+                return pred.softmax(dim=-3)
+            return pred.sigmoid()
+        return pred
+    arr = np.asarray(mask)
+    if mode != "logits":
+        return arr
+    if arr.ndim >= 3 and arr.shape[-1] > 1:
+        shifted = arr - arr.max(axis=-1, keepdims=True)
+        exp = np.exp(shifted)
+        denom = np.clip(exp.sum(axis=-1, keepdims=True), a_min=1e-8, a_max=None)
+        return exp / denom
+    return 1.0 / (1.0 + np.exp(-arr))
+
+
 def ensure_dir(path: str):
     if not path:
         return
@@ -149,14 +179,28 @@ def to_numpy_mask(mask):
     return mask
 
 
-def save_segmentation(mask: np.ndarray, frame_idx: int):
+def prediction_to_label(mask, output_mode: Optional[str] = None):
+    prob = prediction_to_prob(mask, output_mode=output_mode)
+    if prob is None:
+        return None
+    prob_np = to_numpy_mask(prob)
+    if prob_np is None:
+        return None
+    prob_np = np.asarray(prob_np)
+    if prob_np.ndim == 3 and prob_np.shape[2] > 1:
+        return np.argmax(prob_np, axis=2).astype(np.uint8)
+    prob_single = np.squeeze(prob_np)
+    return (prob_single >= 0.5).astype(np.uint8)
+
+
+def save_segmentation(mask: np.ndarray, frame_idx: int, output_mode: Optional[str] = None):
     if mask is None:
         return
-    mask = to_numpy_mask(mask)
     ensure_dir(CFG.output_dir)
-    mask_single = np.squeeze(mask)
-    mask_bin = (mask_single >= 0.5).astype(np.uint8) * 100
-    mask_vis = mask_bin.astype(np.uint8)
+    label_map = prediction_to_label(mask, output_mode=output_mode)
+    if label_map is None:
+        return
+    mask_vis = label_map.astype(np.uint8)
     out_path = os.path.join(CFG.output_dir, f"frame_{frame_idx:06d}.png")
     cv2.imwrite(out_path, mask_vis)
 
@@ -168,34 +212,35 @@ def build_palette(num_classes: int) -> np.ndarray:
     return palette
 
 
-def render_segmentation(mask: np.ndarray):
+def render_segmentation(mask: np.ndarray, output_mode: Optional[str] = None):
     if mask is None:
         return None
-    mask = to_numpy_mask(mask)
-    if mask.ndim == 3 and mask.shape[2] > 1:
-        labels = np.argmax(mask, axis=2).astype(np.uint8)
+    labels = prediction_to_label(mask, output_mode=output_mode)
+    if labels is None:
+        return None
+    if labels.ndim == 2 and CFG.num_classes > 1:
         palette = build_palette(CFG.num_classes)
         return palette[labels]
-    mask_single = np.squeeze(mask)
-    mask_bin = (mask_single >= 0.5).astype(np.uint8) * 255
+    mask_bin = labels.astype(np.uint8) * 255
     return cv2.applyColorMap(mask_bin, cv2.COLORMAP_TURBO)
 
 
-def overlay_mask(frame: np.ndarray, mask: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+def overlay_mask(frame: np.ndarray, mask: np.ndarray, alpha: float = 0.5, output_mode: Optional[str] = None) -> np.ndarray:
     frame = to_numpy_image(frame)
     if frame is None:
         return None
     if mask is None:
         return frame
-    mask = to_numpy_mask(mask)
-    mask_bin = np.squeeze(mask)
-    mask_bin = (mask_bin >= 0.5).astype(np.uint8)
-    if mask_bin.ndim == 3 and mask_bin.shape[2] > 1:
-        mask_bin = np.argmax(mask_bin, axis=2).astype(np.uint8)
-    mask_bin = cv2.resize(mask_bin, (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
-    green = np.zeros_like(frame)
-    green[..., 1] = 255
-    color = frame * (1 - mask_bin[..., None]) + green * mask_bin[..., None]
+    label_map = prediction_to_label(mask, output_mode=output_mode)
+    if label_map is None:
+        return frame
+    label_map = cv2.resize(label_map.astype(np.uint8), (frame.shape[1], frame.shape[0]), interpolation=cv2.INTER_NEAREST)
+    if CFG.num_classes > 1:
+        color = build_palette(CFG.num_classes)[label_map]
+    else:
+        green = np.zeros_like(frame)
+        green[..., 1] = 255
+        color = frame * (1 - label_map[..., None]) + green * label_map[..., None]
     blended = cv2.addWeighted(color.astype(np.uint8), alpha, frame, 1.0 - alpha, 0)
     return blended
 
@@ -277,7 +322,7 @@ def main():
     if CFG.debug:
         ensure_dir(CFG.debug_dir)
     seg_model = CanvasSegModel(CFG)
-    inferencer = StitchInferencer(seg_model, start_frame=CFG.start_frame, cfg=CFG)
+    inferencer = StitchInferencer(seg_model, cfg=CFG, start_frame=CFG.start_frame)
 
     cap = cv2.VideoCapture(CFG.video_path)
     if not cap.isOpened():
@@ -312,24 +357,22 @@ def main():
         profiler.enable()
         inferencer.step_canvas(frame_u) # 4-6s
         if (frame_idx - CFG.start_frame) % stride == 0:
-            seg_map = inferencer.model_inference(frame_u.shape[-2:]) # 0.02s
+            seg_map = inferencer.model_inference() # 0.02s
             profiler.disable()
             if seg_map is not None:
                 if CFG.debug:
                     direct_seg, direct_input = seg_model.predict_on_frame(frame_u)
                     frame_vis = to_numpy_image(frame_u)
-                    overlay_stitched = overlay_mask(frame_vis, seg_map)
-                    overlay_direct = overlay_mask(frame_vis, direct_seg)
+                    overlay_stitched = overlay_mask(frame_vis, seg_map, output_mode=CFG.output_mode)
+                    overlay_direct = overlay_mask(frame_vis, direct_seg, output_mode="logits")
                     canvas_vis = inferencer.canvas
                     canvas_vis = to_numpy_image(canvas_vis)
                     if canvas_vis is not None and frame_vis is not None and canvas_vis.shape[:2] != frame_vis.shape[:2]:
                         canvas_vis = cv2.resize(canvas_vis, (frame_vis.shape[1], frame_vis.shape[0]), interpolation=cv2.INTER_LINEAR)
                     model_input = inferencer.last_model_input if inferencer.last_model_input is not None else seg_model.last_model_input_image
                     model_output = inferencer.last_model_output if inferencer.last_model_output is not None else seg_model.last_model_output
-                    # model_output is a probability/logit-like map; don't convert it to an 8-bit image
-                    # before thresholding in overlay_mask().
                     model_input = to_numpy_image(model_input)
-                    model_input = overlay_mask(model_input, model_output, alpha=0.2)
+                    model_input = overlay_mask(model_input, model_output, alpha=0.2, output_mode="logits")
                     # Build a 3x2 grid for visual sanity checks.
                     panel = build_debug_panel(
                         [

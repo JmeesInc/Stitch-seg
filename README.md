@@ -14,11 +14,16 @@ from stitch_seg import StitchInferencer
 import torch
 
 seg_model = MySegModel().cuda().eval() # Assume input is 0~255 tensor, please define preprocess pipeline at MySegmodel.forward()
-infer = StitchInferencer(model=seg_model)
+inferencer = StitchInferencer(model=seg_model)
 
-frame_t = torch.zeros(1, 3, 480, 854, device="cuda")  # (1, 3, H, W) float
-infer.step_canvas(frame_t)
-pred = infer.model_inference(frame_shape=(480, 854))   # (C, H, W)
+cap = cv2.VideoCapture("video.mp4")
+while True:
+    ret, frame_np = cap.read()
+    if not ret:
+        break
+    frame_torch = inferencer.preprocess_frame(frame_np)
+    pred = inferencer(frame_torch)
+    
 ```
 
 ### Use on Tracking
