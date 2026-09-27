@@ -327,17 +327,25 @@ CC BY-NC-SA 4.0
 
 ---
 
+## Citation
+```
+@InProceedings{ StitchInferencer_MICCAISafeSurg2026,
+                 author = { Kikuchi, Shunsuke AND Kouno, Atsushi AND Matsuzaki, Hiroki },
+                 title = { { Stitch-Inferencer: Enhance Endoscopic Video Segmentation and Tracking via Panoramic Reconstruction } }, 
+                 booktitle = {Medical Image Computing and Computer Assisted Intervention -- MICCAI 2026 Workshops and Challenges},
+                 year = {2026},
+                 publisher = {Springer Nature Switzerland},
+                 volume = { LNCS pending },
+                 month = {pending},
+                 pages = { pending },
+              }
+```
+
+---
+
 ## Acknowledgements
 
 This project depends on / is inspired by:
 
 - [LightGlue](https://github.com/cvg/LightGlue) / [ALIKED](https://github.com/Shiaoming/ALIKED) ([alikked-tensorrt](https://github.com/ajuric/aliked-tensorrt), [LightGlue-ONNX](https://github.com/fabio-sim/LightGlue-ONNX) as well)
 - [segmentation-models-pytorch](https://github.com/qubvel-org/segmentation_models.pytorch)
-
-Please Cite Our Work in your research:
-```
-@misc{stitchinferencer,
-title={From Frame to Panorama: Learning-Free Spatial Memory via Stitch-Inferencer for Real-Time Surgical Video Understanding},
-author={Kikuchi, Shunsuke and Kouno, Atushi and Matsuzaki, Hiroki},
-}
-```
